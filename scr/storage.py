@@ -1,0 +1,896 @@
+from __future__ import annotations
+
+import io
+import json
+import re
+import shutil
+from pathlib import Path
+from typing import Any
+
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+from src.exporters import build_exam_html, build_exam_markdown
+from src.models import QuestionRecord, UserRecord
+
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+FOLDER_MIME = "application/vnd.google-apps.folder"
+KNOWN_SUBJECT_FOLDERS = ("수학", "사회", "과학")
+
+
+def _safe_segment(name: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (name or "").strip()).strip(". ")
+    return cleaned or "기타"
+
+
+class StorageManager:
+    """Google Drive(OAuth 2.0 개인 드라이브 / 서비스 계정 공유 드라이브) 및 로컬 ./exam_db 폴백 영구 저장소 관리자."""
+
+    def __init__(
+        self,
+        local_root: str | Path = "./exam_db",
+        service_account_info: dict[str, Any] | None = None,
+        drive_folder_id: str = "",
+        oauth_info: dict[str, Any] | None = None,
+    ) -> None:
+        self.local_root = Path(local_root)
+        self.pdfs_dir = self.local_root / "pdfs"
+        self.crops_dir = self.local_root / "crops"
+        self.organized_dir = self.local_root / "과목별_기출DB"
+        self.db_path = self.local_root / "db.json"
+        self.users_path = self.local_root / "users.json"
+
+        self.local_root.mkdir(parents=True, exist_ok=True)
+        self.pdfs_dir.mkdir(parents=True, exist_ok=True)
+        self.crops_dir.mkdir(parents=True, exist_ok=True)
+        self.organized_dir.mkdir(parents=True, exist_ok=True)
+
+        self.drive_folder_id = drive_folder_id.strip()
+        self.service_account_info = service_account_info
+        self.oauth_info = oauth_info
+        self.drive_auth_mode: str = ""
+        self.drive_service: Any | None = None
+        self.drive_connected: bool = False
+        self.drive_folder_name: str = ""
+        self.drive_error: str = ""
+
+        self._subfolder_ids: dict[tuple[str, str], str] = {}
+
+        if (self.oauth_info or self.service_account_info) and self.drive_folder_id:
+            self._init_drive_client()
+
+    def _init_drive_client(self) -> None:
+        try:
+            if self.oauth_info:
+                creds = OAuthCredentials(
+                    token=None,
+                    refresh_token=self.oauth_info["refresh_token"],
+                    token_uri=self.oauth_info.get("token_uri", "https://oauth2.googleapis.com/token"),
+                    client_id=self.oauth_info["client_id"],
+                    client_secret=self.oauth_info["client_secret"],
+                    scopes=DRIVE_SCOPES,
+                )
+                if not creds.valid and creds.refresh_token:
+                    creds.refresh(GoogleAuthRequest())
+                self.drive_auth_mode = "oauth"
+            else:
+                creds = ServiceAccountCredentials.from_service_account_info(
+                    self.service_account_info,
+                    scopes=DRIVE_SCOPES,
+                )
+                self.drive_auth_mode = "service_account"
+            service = build("drive", "v3", credentials=creds, cache_discovery=False)
+            meta = (
+                service.files()
+                .get(
+                    fileId=self.drive_folder_id,
+                    fields="id, name, mimeType, driveId",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+            if meta.get("mimeType") != FOLDER_MIME:
+                self.drive_error = f"지정한 ID({self.drive_folder_id})가 폴더가 아닙니다."
+                return
+
+            self.drive_service = service
+            self.drive_connected = True
+            self.drive_folder_name = meta.get("name", self.drive_folder_id)
+            self.drive_error = ""
+        except Exception as exc:
+            self.drive_service = None
+            self.drive_connected = False
+            self.drive_error = str(exc)
+
+    def _list_children(self, parent_id: str, extra_query: str = "") -> list[dict[str, Any]]:
+        """지정 폴더 하위 항목을 페이지네이션까지 모두 조회한다."""
+        if not self.drive_service:
+            return []
+
+        q = f"'{parent_id}' in parents and trashed = false"
+        if extra_query:
+            q = f"{q} and {extra_query}"
+
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            resp = (
+                self.drive_service.files()
+                .list(
+                    q=q,
+                    fields="nextPageToken, files(id, name, mimeType, size)",
+                    pageSize=200,
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                )
+                .execute()
+            )
+            items.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return items
+
+    def _find_drive_subfolder(self, folder_name: str, parent_id: str | None = None) -> str | None:
+        if not self.drive_connected or not self.drive_service:
+            return None
+        pid = parent_id or self.drive_folder_id
+        cache_key = (pid, folder_name)
+        if cache_key in self._subfolder_ids:
+            return self._subfolder_ids[cache_key]
+
+        safe_name = folder_name.replace("'", "\\'")
+        found = self._list_children(
+            pid,
+            extra_query=f"mimeType = '{FOLDER_MIME}' and name = '{safe_name}'",
+        )
+        if found:
+            fid = found[0]["id"]
+            self._subfolder_ids[cache_key] = fid
+            return fid
+        return None
+
+    def _ensure_drive_subfolder(self, folder_name: str, parent_id: str | None = None) -> str | None:
+        if not self.drive_connected or not self.drive_service:
+            return None
+        pid = parent_id or self.drive_folder_id
+        existing_id = self._find_drive_subfolder(folder_name, parent_id=pid)
+        if existing_id:
+            return existing_id
+
+        created = (
+            self.drive_service.files()
+            .create(
+                body={
+                    "name": folder_name,
+                    "mimeType": FOLDER_MIME,
+                    "parents": [pid],
+                },
+                fields="id",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        fid = created["id"]
+        self._subfolder_ids[(pid, folder_name)] = fid
+        return fid
+
+    def _ensure_drive_exam_folder(self, subject_category: str, exam_name: str) -> str | None:
+        subj_id = self._ensure_drive_subfolder(_safe_segment(subject_category))
+        if not subj_id:
+            return None
+        return self._ensure_drive_subfolder(_safe_segment(exam_name), parent_id=subj_id)
+
+    def _find_drive_exam_folder(self, subject_category: str, exam_name: str) -> str | None:
+        subj_id = self._find_drive_subfolder(_safe_segment(subject_category))
+        if not subj_id:
+            return None
+        return self._find_drive_subfolder(_safe_segment(exam_name), parent_id=subj_id)
+
+    def _local_exam_dir(self, subject_category: str, exam_name: str) -> Path:
+        target = self.organized_dir / _safe_segment(subject_category) / _safe_segment(exam_name)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def _trash_drive_item(self, file_id: str) -> None:
+        if not self.drive_connected or not self.drive_service:
+            return
+        self.drive_service.files().update(
+            fileId=file_id,
+            body={"trashed": True},
+            supportsAllDrives=True,
+        ).execute()
+
+    def _download_file_bytes(self, file_id: str) -> bytes:
+        assert self.drive_service is not None
+        request = self.drive_service.files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+        )
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return buf.getvalue()
+
+    def _upsert_drive_file(
+        self,
+        parent_id: str,
+        filename: str,
+        data: bytes,
+        mime_type: str,
+        known_existing_id: str | None = None,
+        skip_lookup: bool = False,
+    ) -> str | None:
+        if not self.drive_connected or not self.drive_service:
+            return None
+
+        file_id = known_existing_id
+        if not file_id and not skip_lookup:
+            safe_name = filename.replace("'", "\\'")
+            existing = self._list_children(
+                parent_id,
+                extra_query=f"mimeType != '{FOLDER_MIME}' and name = '{safe_name}'",
+            )
+            if existing:
+                file_id = existing[0]["id"]
+
+        media = MediaIoBaseUpload(
+            io.BytesIO(data),
+            mimetype=mime_type,
+            resumable=len(data) > 512 * 1024,
+        )
+        if file_id:
+            self.drive_service.files().update(
+                fileId=file_id,
+                media_body=media,
+                supportsAllDrives=True,
+            ).execute()
+            return file_id
+
+        created = (
+            self.drive_service.files()
+            .create(
+                body={"name": filename, "parents": [parent_id]},
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        return created.get("id")
+
+    def sync_on_startup(self) -> dict[str, Any]:
+        """앱 시작 시 Google Drive의 db.json, users.json 및 과목·회차별 폴더를 로컬과 동기화한다."""
+        result: dict[str, Any] = {
+            "connected": self.drive_connected,
+            "folder_name": self.drive_folder_name,
+            "db_synced": False,
+            "users_synced": False,
+            "crops_downloaded": 0,
+            "pdfs_downloaded": 0,
+            "error": self.drive_error,
+        }
+        if not self.drive_connected or not self.drive_service:
+            return result
+
+        try:
+            # 1) db.json 동기화
+            root_files = self._list_children(
+                self.drive_folder_id,
+                extra_query="name = 'db.json'",
+            )
+            if root_files:
+                db_bytes = self._download_file_bytes(root_files[0]["id"])
+                self.db_path.write_bytes(db_bytes)
+                result["db_synced"] = True
+            elif self.db_path.exists():
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "db.json",
+                    self.db_path.read_bytes(),
+                    "application/json",
+                )
+                result["db_synced"] = True
+
+            # 1-b) users.json 동기화
+            user_files = self._list_children(
+                self.drive_folder_id,
+                extra_query="name = 'users.json'",
+            )
+            if user_files:
+                users_bytes = self._download_file_bytes(user_files[0]["id"])
+                self.users_path.write_bytes(users_bytes)
+                result["users_synced"] = True
+            elif self.users_path.exists():
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "users.json",
+                    self.users_path.read_bytes(),
+                    "application/json",
+                )
+                result["users_synced"] = True
+
+            # 2) 과목별/회차별 폴더 동기화 (수학/사회/과학/<회차명>/*)
+            for root_item in self._list_children(
+                self.drive_folder_id,
+                extra_query=f"mimeType = '{FOLDER_MIME}'",
+            ):
+                fname = root_item["name"]
+                if fname in ("crops", "pdfs"):
+                    continue
+                subj_dir_name = _safe_segment(fname)
+                for exam_item in self._list_children(
+                    root_item["id"],
+                    extra_query=f"mimeType = '{FOLDER_MIME}'",
+                ):
+                    local_exam_dir = self.organized_dir / subj_dir_name / _safe_segment(exam_item["name"])
+                    local_exam_dir.mkdir(parents=True, exist_ok=True)
+                    for leaf in self._list_children(
+                        exam_item["id"],
+                        extra_query=f"mimeType != '{FOLDER_MIME}'",
+                    ):
+                        leaf_name = leaf["name"]
+                        remote_size = int(leaf.get("size", 0) or 0)
+                        org_target = local_exam_dir / leaf_name
+                        need_dl = not org_target.exists() or (
+                            remote_size > 0 and org_target.stat().st_size != remote_size
+                        )
+                        if need_dl:
+                            data = self._download_file_bytes(leaf["id"])
+                            org_target.write_bytes(data)
+                            lower = leaf_name.lower()
+                            if lower.endswith(".png"):
+                                (self.crops_dir / leaf_name).write_bytes(data)
+                                result["crops_downloaded"] += 1
+                            elif lower.endswith(".pdf"):
+                                (self.pdfs_dir / leaf_name).write_bytes(data)
+                                result["pdfs_downloaded"] += 1
+
+            # 3) 레거시 crops / pdfs 폴더 하위 호환 동기화 (폴더가 존재하는 경우만)
+            legacy_crops_id = self._find_drive_subfolder("crops")
+            if legacy_crops_id:
+                for item in self._list_children(legacy_crops_id, extra_query=f"mimeType != '{FOLDER_MIME}'"):
+                    target = self.crops_dir / item["name"]
+                    remote_size = int(item.get("size", 0) or 0)
+                    if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
+                        target.write_bytes(self._download_file_bytes(item["id"]))
+                        result["crops_downloaded"] += 1
+
+            legacy_pdfs_id = self._find_drive_subfolder("pdfs")
+            if legacy_pdfs_id:
+                for item in self._list_children(legacy_pdfs_id, extra_query=f"mimeType != '{FOLDER_MIME}'"):
+                    target = self.pdfs_dir / item["name"]
+                    remote_size = int(item.get("size", 0) or 0)
+                    if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
+                        target.write_bytes(self._download_file_bytes(item["id"]))
+                        result["pdfs_downloaded"] += 1
+
+        except Exception as exc:
+            result["error"] = str(exc)
+
+        return result
+
+    def load_db(self) -> list[QuestionRecord]:
+        if not self.db_path.exists():
+            return []
+        try:
+            raw = json.loads(self.db_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                return []
+            return [QuestionRecord.model_validate(item) for item in raw]
+        except Exception:
+            return []
+
+    def export_organized_exam_files(
+        self,
+        records: list[QuestionRecord],
+        sync_drive: bool = True,
+        target_exams: set[str] | None = None,
+    ) -> list[Path]:
+        """과목별 · 모의고사 회차별 폴더에 JSON / Markdown / HTML 정리 파일을 생성하고 Drive에 업로드한다."""
+        grouped: dict[tuple[str, str], list[QuestionRecord]] = {}
+        for rec in records:
+            if target_exams is not None and rec.exam_name not in target_exams:
+                continue
+            grouped.setdefault((rec.subject_category, rec.exam_name), []).append(rec)
+
+        written_dirs: list[Path] = []
+        for (subj, exam), group_recs in grouped.items():
+            ordered = sorted(group_recs, key=lambda r: r.q_num)
+            exam_dir = self._local_exam_dir(subj, exam)
+
+            json_bytes = json.dumps(
+                [r.model_dump() for r in ordered],
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            md_bytes = build_exam_markdown(exam, subj, ordered).encode("utf-8")
+            html_bytes = build_exam_html(
+                exam,
+                subj,
+                ordered,
+                crop_loader=lambda fn, s=subj, e=exam: self.get_crop_bytes(
+                    fn, subject_category=s, exam_name=e
+                ),
+            ).encode("utf-8")
+
+            (exam_dir / "문제목록.json").write_bytes(json_bytes)
+            (exam_dir / "기출정리.md").write_bytes(md_bytes)
+            (exam_dir / "기출정리.html").write_bytes(html_bytes)
+            written_dirs.append(exam_dir)
+
+            if sync_drive and self.drive_connected:
+                drive_exam_id = self._ensure_drive_exam_folder(subj, exam)
+                if drive_exam_id:
+                    self._upsert_drive_file(drive_exam_id, "문제목록.json", json_bytes, "application/json")
+                    self._upsert_drive_file(drive_exam_id, "기출정리.md", md_bytes, "text/markdown")
+                    self._upsert_drive_file(drive_exam_id, "기출정리.html", html_bytes, "text/html")
+
+        return written_dirs
+
+    def save_db(
+        self,
+        records: list[QuestionRecord],
+        sync_organized_drive: bool = True,
+        target_exams: set[str] | None = None,
+        sync_db_drive: bool = True,
+        sync_local_organized: bool = True,
+    ) -> str | None:
+        payload = [rec.model_dump() for rec in records]
+        raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        self.db_path.write_text(raw_text, encoding="utf-8")
+
+        errors: list[str] = []
+        if sync_local_organized or sync_organized_drive:
+            try:
+                self.export_organized_exam_files(
+                    records,
+                    sync_drive=sync_organized_drive,
+                    target_exams=target_exams,
+                )
+            except Exception as exc:
+                errors.append(f"과목·회차별 정리 파일 생성/동기화 오류: {exc}")
+
+        if sync_db_drive and self.drive_connected:
+            try:
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "db.json",
+                    raw_text.encode("utf-8"),
+                    "application/json",
+                )
+            except Exception as exc:
+                errors.append(f"Drive db.json 동기화 오류: {exc}")
+
+        return " / ".join(errors) if errors else None
+
+    def load_users(self) -> list[UserRecord]:
+        if not self.users_path.exists():
+            return []
+        try:
+            raw = json.loads(self.users_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                return []
+            needs_migration = any(
+                isinstance(item, dict)
+                and (
+                    str(item.get("tier", "")).strip().upper() in ("BYOK", "ULTRA")
+                    or "custom_api_key" not in item
+                )
+                for item in raw
+            )
+            users = [UserRecord.model_validate(item) for item in raw]
+            if needs_migration:
+                self.save_users(users)
+            return users
+        except Exception:
+            return []
+
+    def save_users(self, users: list[UserRecord]) -> str | None:
+        payload = [u.model_dump() for u in users]
+        raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        self.users_path.write_text(raw_text, encoding="utf-8")
+
+        if self.drive_connected:
+            try:
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "users.json",
+                    raw_text.encode("utf-8"),
+                    "application/json",
+                )
+            except Exception as exc:
+                return f"로컬 users.json 저장 완료 / Drive 동기화 오류: {exc}"
+        return None
+
+    def save_crop_png(
+        self,
+        filename: str,
+        png_bytes: bytes,
+        subject_category: str = "",
+        exam_name: str = "",
+        sync_drive: bool = True,
+    ) -> str | None:
+        (self.crops_dir / filename).write_bytes(png_bytes)
+        if subject_category and exam_name:
+            (self._local_exam_dir(subject_category, exam_name) / filename).write_bytes(png_bytes)
+
+        if sync_drive and self.drive_connected:
+            try:
+                if subject_category and exam_name:
+                    folder_id = self._ensure_drive_exam_folder(subject_category, exam_name)
+                else:
+                    folder_id = self._ensure_drive_subfolder("crops")
+                if folder_id:
+                    self._upsert_drive_file(folder_id, filename, png_bytes, "image/png")
+            except Exception as exc:
+                return f"로컬 크롭 저장 완료 / Drive 업로드 오류: {exc}"
+        return None
+
+    def save_pdf_file(
+        self,
+        filename: str,
+        pdf_bytes: bytes,
+        subject_category: str = "",
+        exam_name: str = "",
+        sync_drive: bool = True,
+    ) -> str | None:
+        (self.pdfs_dir / filename).write_bytes(pdf_bytes)
+        if subject_category and exam_name:
+            (self._local_exam_dir(subject_category, exam_name) / filename).write_bytes(pdf_bytes)
+
+        if sync_drive and self.drive_connected:
+            try:
+                if subject_category and exam_name:
+                    folder_id = self._ensure_drive_exam_folder(subject_category, exam_name)
+                else:
+                    folder_id = self._ensure_drive_subfolder("pdfs")
+                if folder_id:
+                    self._upsert_drive_file(folder_id, filename, pdf_bytes, "application/pdf")
+            except Exception as exc:
+                return f"로컬 PDF 저장 완료 / Drive 업로드 오류: {exc}"
+        return None
+
+    def sync_exam_batch(
+        self,
+        subject_category: str,
+        exam_name: str,
+        records: list[QuestionRecord],
+        crop_filenames: list[str] | None = None,
+        pdf_filenames: list[str] | None = None,
+        include_organized_exports: bool = True,
+    ) -> str | None:
+        """
+        로컬에 축적된 회차별 크롭·PDF·정리 파일(HTML/MD/JSON)과 db.json을
+        Google Drive에 한 번에 일괄 동기화한다(중간 백업 및 최종 일괄 업로드용).
+        """
+        payload = [rec.model_dump() for rec in records]
+        raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        self.db_path.write_text(raw_text, encoding="utf-8")
+
+        errors: list[str] = []
+        if include_organized_exports:
+            try:
+                self.export_organized_exam_files(
+                    records,
+                    sync_drive=False,
+                    target_exams={exam_name},
+                )
+            except Exception as exc:
+                errors.append(f"로컬 정리 파일 생성 오류: {exc}")
+
+        if not self.drive_connected:
+            return " / ".join(errors) if errors else None
+
+        try:
+            exam_folder_id = self._ensure_drive_exam_folder(subject_category, exam_name)
+            if exam_folder_id:
+                existing_map = {
+                    item["name"]: item["id"]
+                    for item in self._list_children(
+                        exam_folder_id,
+                        extra_query=f"mimeType != '{FOLDER_MIME}'",
+                    )
+                }
+                local_exam_dir = self._local_exam_dir(subject_category, exam_name)
+
+                for pdf_fn in pdf_filenames or []:
+                    src_pdf = self.pdfs_dir / pdf_fn
+                    if not src_pdf.exists():
+                        src_pdf = local_exam_dir / pdf_fn
+                    if src_pdf.exists():
+                        fid = self._upsert_drive_file(
+                            exam_folder_id,
+                            pdf_fn,
+                            src_pdf.read_bytes(),
+                            "application/pdf",
+                            known_existing_id=existing_map.get(pdf_fn),
+                            skip_lookup=True,
+                        )
+                        if fid:
+                            existing_map[pdf_fn] = fid
+
+                for crop_fn in crop_filenames or []:
+                    src_crop = self.crops_dir / crop_fn
+                    if not src_crop.exists():
+                        src_crop = local_exam_dir / crop_fn
+                    if src_crop.exists():
+                        fid = self._upsert_drive_file(
+                            exam_folder_id,
+                            crop_fn,
+                            src_crop.read_bytes(),
+                            "image/png",
+                            known_existing_id=existing_map.get(crop_fn),
+                            skip_lookup=True,
+                        )
+                        if fid:
+                            existing_map[crop_fn] = fid
+
+                if include_organized_exports:
+                    for export_fn, mime in (
+                        ("문제목록.json", "application/json"),
+                        ("기출정리.md", "text/markdown"),
+                        ("기출정리.html", "text/html"),
+                    ):
+                        export_path = local_exam_dir / export_fn
+                        if export_path.exists():
+                            fid = self._upsert_drive_file(
+                                exam_folder_id,
+                                export_fn,
+                                export_path.read_bytes(),
+                                mime,
+                                known_existing_id=existing_map.get(export_fn),
+                                skip_lookup=True,
+                            )
+                            if fid:
+                                existing_map[export_fn] = fid
+
+            self._upsert_drive_file(
+                self.drive_folder_id,
+                "db.json",
+                raw_text.encode("utf-8"),
+                "application/json",
+            )
+        except Exception as exc:
+            errors.append(f"Google Drive 일괄 동기화 오류: {exc}")
+
+        return " / ".join(errors) if errors else None
+
+    def _resolve_exam_meta_for_file(
+        self,
+        filename: str,
+        subject_category: str = "",
+        exam_name: str = "",
+    ) -> tuple[str, str]:
+        if subject_category and exam_name:
+            return subject_category, exam_name
+        for rec in self.load_db():
+            if filename in (rec.image_filename, rec.source_pdf, rec.answer_pdf):
+                return rec.subject_category, rec.exam_name
+        return subject_category, exam_name
+
+    def get_crop_bytes(
+        self,
+        filename: str,
+        subject_category: str = "",
+        exam_name: str = "",
+    ) -> bytes | None:
+        if not filename:
+            return None
+        local_path = self.crops_dir / filename
+        if local_path.exists():
+            return local_path.read_bytes()
+
+        subj, exam = self._resolve_exam_meta_for_file(filename, subject_category, exam_name)
+        if subj and exam:
+            org_path = self.organized_dir / _safe_segment(subj) / _safe_segment(exam) / filename
+            if org_path.exists():
+                data = org_path.read_bytes()
+                local_path.write_bytes(data)
+                return data
+
+        if self.drive_connected:
+            try:
+                safe_name = filename.replace("'", "\\'")
+                search_folders: list[str] = []
+                if subj and exam:
+                    exam_folder = self._find_drive_exam_folder(subj, exam)
+                    if exam_folder:
+                        search_folders.append(exam_folder)
+                legacy_crops = self._find_drive_subfolder("crops")
+                if legacy_crops:
+                    search_folders.append(legacy_crops)
+
+                for fid in search_folders:
+                    found = self._list_children(fid, extra_query=f"name = '{safe_name}'")
+                    if found:
+                        data = self._download_file_bytes(found[0]["id"])
+                        local_path.write_bytes(data)
+                        if subj and exam:
+                            (self._local_exam_dir(subj, exam) / filename).write_bytes(data)
+                        return data
+            except Exception:
+                return None
+        return None
+
+    def get_pdf_bytes(
+        self,
+        filename: str,
+        subject_category: str = "",
+        exam_name: str = "",
+    ) -> bytes | None:
+        if not filename:
+            return None
+        local_path = self.pdfs_dir / filename
+        if local_path.exists():
+            return local_path.read_bytes()
+
+        subj, exam = self._resolve_exam_meta_for_file(filename, subject_category, exam_name)
+        if subj and exam:
+            org_path = self.organized_dir / _safe_segment(subj) / _safe_segment(exam) / filename
+            if org_path.exists():
+                data = org_path.read_bytes()
+                local_path.write_bytes(data)
+                return data
+
+        if self.drive_connected:
+            try:
+                safe_name = filename.replace("'", "\\'")
+                search_folders: list[str] = []
+                if subj and exam:
+                    exam_folder = self._find_drive_exam_folder(subj, exam)
+                    if exam_folder:
+                        search_folders.append(exam_folder)
+                legacy_pdfs = self._find_drive_subfolder("pdfs")
+                if legacy_pdfs:
+                    search_folders.append(legacy_pdfs)
+
+                for fid in search_folders:
+                    found = self._list_children(fid, extra_query=f"name = '{safe_name}'")
+                    if found:
+                        data = self._download_file_bytes(found[0]["id"])
+                        local_path.write_bytes(data)
+                        if subj and exam:
+                            (self._local_exam_dir(subj, exam) / filename).write_bytes(data)
+                        return data
+            except Exception:
+                return None
+        return None
+
+    def delete_question(self, question_id: str) -> None:
+        records = self.load_db()
+        target_rec = next((r for r in records if r.id == question_id), None)
+        remaining = [r for r in records if r.id != question_id]
+
+        if target_rec and target_rec.image_filename:
+            (self.crops_dir / target_rec.image_filename).unlink(missing_ok=True)
+            org_img = (
+                self.organized_dir
+                / _safe_segment(target_rec.subject_category)
+                / _safe_segment(target_rec.exam_name)
+                / target_rec.image_filename
+            )
+            org_img.unlink(missing_ok=True)
+
+            if self.drive_connected and self.drive_service:
+                try:
+                    safe_name = target_rec.image_filename.replace("'", "\\'")
+                    folders = []
+                    exam_fid = self._find_drive_exam_folder(target_rec.subject_category, target_rec.exam_name)
+                    if exam_fid:
+                        folders.append(exam_fid)
+                    legacy_fid = self._find_drive_subfolder("crops")
+                    if legacy_fid:
+                        folders.append(legacy_fid)
+                    for fid in folders:
+                        for item in self._list_children(fid, extra_query=f"name = '{safe_name}'"):
+                            self._trash_drive_item(item["id"])
+                except Exception:
+                    pass
+
+        target_exams = {target_rec.exam_name} if target_rec else None
+        self.save_db(remaining, target_exams=target_exams)
+
+    def delete_exam(self, exam_name: str) -> int:
+        records = self.load_db()
+        to_delete = [r for r in records if r.exam_name == exam_name]
+        remaining = [r for r in records if r.exam_name != exam_name]
+        subj_cats = {r.subject_category for r in to_delete}
+        pdf_names = {n for r in to_delete for n in (r.source_pdf, r.answer_pdf) if n}
+
+        for rec in to_delete:
+            if rec.image_filename:
+                (self.crops_dir / rec.image_filename).unlink(missing_ok=True)
+                if self.drive_connected and self.drive_service:
+                    try:
+                        legacy_fid = self._find_drive_subfolder("crops")
+                        if legacy_fid:
+                            safe_name = rec.image_filename.replace("'", "\\'")
+                            for item in self._list_children(legacy_fid, extra_query=f"name = '{safe_name}'"):
+                                self._trash_drive_item(item["id"])
+                    except Exception:
+                        pass
+
+        for pdf_fn in pdf_names:
+            (self.pdfs_dir / pdf_fn).unlink(missing_ok=True)
+            if self.drive_connected and self.drive_service:
+                try:
+                    legacy_pdfs = self._find_drive_subfolder("pdfs")
+                    if legacy_pdfs:
+                        safe_name = pdf_fn.replace("'", "\\'")
+                        for item in self._list_children(legacy_pdfs, extra_query=f"name = '{safe_name}'"):
+                            self._trash_drive_item(item["id"])
+                except Exception:
+                    pass
+
+        for subj in subj_cats:
+            org_exam_dir = self.organized_dir / _safe_segment(subj) / _safe_segment(exam_name)
+            if org_exam_dir.exists():
+                shutil.rmtree(org_exam_dir, ignore_errors=True)
+            if self.drive_connected and self.drive_service:
+                try:
+                    exam_fid = self._find_drive_exam_folder(subj, exam_name)
+                    if exam_fid:
+                        self._trash_drive_item(exam_fid)
+                        self._subfolder_ids.pop(
+                            (self._find_drive_subfolder(_safe_segment(subj)) or "", _safe_segment(exam_name)),
+                            None,
+                        )
+                except Exception:
+                    pass
+
+        self.save_db(remaining, sync_organized_drive=False)
+        return len(to_delete)
+
+    def reset_exam_database(self, delete_users: bool = False) -> dict[str, Any]:
+        """로컬 및 Google Drive에 누적된 기출 DB·이미지·PDF 파일을 모두 삭제(초기화)한다."""
+        removed_local = 0
+        for folder in (self.crops_dir, self.pdfs_dir):
+            if folder.exists():
+                for child in folder.iterdir():
+                    if child.is_file():
+                        child.unlink(missing_ok=True)
+                        removed_local += 1
+                    elif child.is_dir():
+                        shutil.rmtree(child, ignore_errors=True)
+                        removed_local += 1
+
+        if self.organized_dir.exists():
+            for child in list(self.organized_dir.iterdir()):
+                shutil.rmtree(child, ignore_errors=True) if child.is_dir() else child.unlink(missing_ok=True)
+                removed_local += 1
+
+        self.db_path.write_text("[]", encoding="utf-8")
+        if delete_users and self.users_path.exists():
+            self.users_path.unlink(missing_ok=True)
+
+        trashed_drive = 0
+        drive_err = ""
+        if self.drive_connected and self.drive_service:
+            try:
+                for item in self._list_children(self.drive_folder_id):
+                    if not delete_users and item.get("name") == "users.json":
+                        continue
+                    self._trash_drive_item(item["id"])
+                    trashed_drive += 1
+                self._subfolder_ids.clear()
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "db.json",
+                    b"[]",
+                    "application/json",
+                )
+            except Exception as exc:
+                drive_err = str(exc)
+
+        return {
+            "removed_local": removed_local,
+            "trashed_drive": trashed_drive,
+            "drive_error": drive_err,
+        }

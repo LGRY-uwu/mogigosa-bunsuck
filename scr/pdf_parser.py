@@ -1,0 +1,723 @@
+from __future__ import annotations
+
+import io
+import re
+from dataclasses import dataclass
+
+import pymupdf
+from PIL import Image
+
+QUESTION_START_RE = re.compile(r"^(\d{1,2})\s*\.(?!\d)\s*(.*)$")
+SHARED_PASSAGE_RE = re.compile(r"^[\[\【]\s*(\d{1,2})\s*[~\-～–—]\s*(\d{1,2})\s*(?:번)?\s*[\]\】]")
+
+
+@dataclass
+class CroppedQuestion:
+    q_num: int
+    page_num: int  # 1-indexed
+    png_bytes: bytes
+    width: int
+    height: int
+    extracted_text: str
+
+
+def get_pdf_page_count(pdf_bytes: bytes) -> int:
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        return doc.page_count
+
+
+def get_page_text_lengths(pdf_bytes: bytes) -> list[int]:
+    """각 페이지(0-based 순서)의 공백 제외 텍스트 길이를 반환한다."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        return [
+            len(re.sub(r"\s+", "", doc[i].get_text("text") or ""))
+            for i in range(doc.page_count)
+        ]
+
+
+def render_pdf_page_png(pdf_bytes: bytes, page_num: int, dpi: int = 160) -> bytes:
+    """1-based page_num에 해당하는 PDF 페이지를 PNG 바이트로 렌더링한다."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        idx = max(0, min(page_num - 1, doc.page_count - 1))
+        page = doc[idx]
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        return pix.tobytes("png")
+
+
+def extract_first_page_for_metadata(
+    pdf_bytes: bytes,
+    dpi: int = 160,
+    min_text_chars: int = 40,
+) -> tuple[str, bytes | None]:
+    """PDF 1페이지 텍스트를 추출하고, 스캔 PDF(텍스트 부족)인 경우 1페이지 PNG를 함께 반환한다."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count == 0:
+            return "", None
+        page = doc[0]
+        raw_text = (page.get_text("text") or "").strip()
+        compact_len = len(re.sub(r"\s+", "", raw_text))
+        if compact_len < min_text_chars:
+            pix = page.get_pixmap(dpi=dpi, alpha=False)
+            return raw_text, pix.tobytes("png")
+        return raw_text, None
+
+
+_LOCAL_SUBJECT_CANDIDATES: tuple[str, ...] = (
+    "통합사회",
+    "통합과학",
+    "생활과 윤리",
+    "윤리와 사상",
+    "한국지리",
+    "세계지리",
+    "동아시아사",
+    "세계사",
+    "정치와 법",
+    "사회·문화",
+    "사회문화",
+    "물리학Ⅱ",
+    "물리학Ⅰ",
+    "물리학2",
+    "물리학1",
+    "물리학",
+    "화학Ⅱ",
+    "화학Ⅰ",
+    "화학2",
+    "화학1",
+    "생명과학Ⅱ",
+    "생명과학Ⅰ",
+    "생명과학2",
+    "생명과학1",
+    "생명과학",
+    "지구과학Ⅱ",
+    "지구과학Ⅰ",
+    "지구과학2",
+    "지구과학1",
+    "지구과학",
+    "공통수학1",
+    "공통수학2",
+    "확률과 통계",
+    "미적분",
+    "기하",
+    "한국사",
+    "경제",
+    "화학",
+    "수학",
+    "국어",
+    "영어",
+)
+
+
+def parse_exam_header_locally(first_page_text: str, filename: str = "") -> dict[str, str] | None:
+    """
+    1페이지 상단 텍스트(및 보조 파일명)에서 시행 년도·월·학년·과목·표준 회차명을
+    정규표현식으로 0.05초 내에 즉시 추출하는 로컬 파서.
+    """
+    header_text = (first_page_text or "").strip()[:2000]
+    fname_clean = re.sub(r"\.pdf$", "", filename or "", flags=re.IGNORECASE)
+    combined = f"{header_text}\n{fname_clean}".strip()
+    if not combined:
+        return None
+
+    year = ""
+    ym = re.search(r"(20\d{2})\s*(?:학년도|년)", combined) or re.search(
+        r"(?:^|[\s_\-.(])(20\d{2})(?:$|[\s_\-.)])", combined
+    )
+    if ym:
+        year = ym.group(1)
+
+    month = ""
+    mm = re.search(r"(?:^|[\s_\-.(])(1[0-2]|[1-9])\s*월", combined)
+    if mm:
+        month = f"{int(mm.group(1))}월"
+    elif "대학수학능력시험" in combined or "수능" in combined:
+        month = "11월"
+
+    grade = ""
+    gm = re.search(r"(고\s*[123])", combined)
+    if gm:
+        grade = gm.group(1).replace(" ", "")
+    else:
+        gm2 = re.search(r"제?\s*([123])\s*학년", combined)
+        if gm2:
+            grade = f"고{gm2.group(1)}"
+        elif "대학수학능력시험" in combined or "모의평가" in combined or "수능" in combined:
+            grade = "고3"
+
+    subject = ""
+    # 시험지 괄호 표기 예: 과학탐구 영역(화학Ⅰ) 우선 매칭
+    paren_m = re.search(r"(?:영역|탐구)\s*\(\s*([^)]+)\s*\)", header_text)
+    if paren_m:
+        cand = paren_m.group(1).strip()
+        if cand:
+            subject = cand
+    if not subject:
+        for s_cand in _LOCAL_SUBJECT_CANDIDATES:
+            if s_cand in combined:
+                subject = s_cand
+                break
+
+    found_count = sum(bool(v) for v in (year, month, grade, subject))
+    if found_count == 0:
+        return None
+
+    tokens = [
+        f"{year}년" if year else "",
+        month,
+        grade,
+        subject,
+    ]
+    exam_title = " ".join(t for t in tokens if t).strip()
+    return {
+        "year": year,
+        "month": month,
+        "grade": grade,
+        "subject": subject,
+        "exam_title": exam_title,
+    }
+
+
+def extract_exam_metadata_fast(
+    pdf_bytes: bytes,
+    filename: str = "",
+    min_text_chars: int = 15,
+) -> tuple[dict[str, str], bool]:
+    """
+    fitz(PyMuPDF)로 1페이지 텍스트만 추출해 정규표현식(re)으로 즉시 메타데이터를 파싱한다.
+    텍스트가 거의 없는 스캔 PDF인 경우 API 호출 없이 빈칸 dict와 False를 반환한다.
+    """
+    empty_meta = {
+        "year": "",
+        "month": "",
+        "grade": "",
+        "subject": "",
+        "exam_title": "",
+    }
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count == 0:
+            return empty_meta, False
+        raw_text = (doc[0].get_text("text") or "").strip()
+
+    compact_len = len(re.sub(r"\s+", "", raw_text))
+    if compact_len < min_text_chars:
+        return empty_meta, False
+
+    parsed = parse_exam_header_locally(raw_text, filename=filename)
+    if parsed is None:
+        return empty_meta, True
+    return parsed, True
+
+
+def extract_pdf_slice(pdf_bytes: bytes, start_page: int, end_page: int) -> tuple[bytes, str, int]:
+    """지정한 페이지 범위(1-based inclusive)의 슬라이스 PDF 바이트와 추출 텍스트를 반환한다."""
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total = doc.page_count
+        s_idx = max(0, min(start_page - 1, total - 1))
+        e_idx = max(s_idx, min(end_page - 1, total - 1))
+
+        sliced_doc = pymupdf.open()
+        sliced_doc.insert_pdf(doc, from_page=s_idx, to_page=e_idx)
+        sliced_bytes = sliced_doc.tobytes(deflate=True)
+        sliced_doc.close()
+
+        text_parts: list[str] = []
+        for idx in range(s_idx, e_idx + 1):
+            page_txt = doc[idx].get_text("text").strip()
+            if page_txt:
+                text_parts.append(f"--- [PDF {idx + 1}쪽] ---\n{page_txt}")
+
+        return sliced_bytes, "\n\n".join(text_parts), (e_idx - s_idx + 1)
+
+
+def _detect_columns(page: pymupdf.Page) -> list[tuple[float, float]]:
+    """
+    모의고사 PDF의 가로 중앙(page_width / 2)을 기준으로 왼쪽 단 -> 오른쪽 단 영역을 반환한다.
+    명백한 1단 통짜 본문(구분선 없고 중앙을 가로지르는 긴 문단 다수)만 예외적으로 1단 처리한다.
+    """
+    w = page.rect.width
+    h = page.rect.height
+    mid_x = w / 2.0
+
+    has_center_divider = False
+    for d in page.get_drawings():
+        rect = d.get("rect")
+        if not rect:
+            continue
+        rw = abs(rect.x1 - rect.x0)
+        rh = abs(rect.y1 - rect.y0)
+        cx = (rect.x0 + rect.x1) / 2.0
+        if (0.44 * w <= cx <= 0.56 * w) and rw <= 5.0 and rh >= 0.20 * h:
+            has_center_divider = True
+            break
+
+    if has_center_divider:
+        return [(0.0, mid_x), (mid_x, w)]
+
+    # 중앙을 가로지르는 순수 1단 문단이 다수이고 오른쪽 단독 컬럼이 전혀 없는 경우에만 1단으로 처리
+    spanning_lines = 0
+    right_only_lines = 0
+    page_dict = page.get_text("dict")
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            if ly1 < 0.14 * h or ly0 > 0.92 * h:
+                continue
+            txt = "".join(sp.get("text", "") for sp in line.get("spans", [])).strip()
+            if len(txt) < 8:
+                continue
+            if lx0 < 0.30 * w and lx1 > 0.70 * w:
+                spanning_lines += 1
+            elif lx0 >= mid_x - 4.0:
+                right_only_lines += 1
+
+    if spanning_lines >= 4 and right_only_lines == 0:
+        return [(0.0, w)]
+    return [(0.0, mid_x), (mid_x, w)]
+
+
+def _extract_lines_in_column(
+    page_dict: dict,
+    col_x0: float,
+    col_x1: float,
+    page_h: float,
+    page_w: float,
+) -> list[dict]:
+    """
+    블록 경계가 2단을 가로지르더라도 span 단위로 칼럼 소속을 분리해
+    해당 단 내 텍스트 라인만 y좌표 -> x좌표 순으로 정렬해 반환한다.
+    """
+    is_two_col = (col_x1 - col_x0) < (0.85 * page_w)
+    lines: list[dict] = []
+
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            if ly1 < 0.035 * page_h or ly0 > 0.945 * page_h:
+                continue
+
+            col_spans: list[dict] = []
+            for sp in line.get("spans", []):
+                stext = sp.get("text", "")
+                if not stext:
+                    continue
+                sx0, sy0, sx1, sy1 = sp.get("bbox", (lx0, ly0, lx1, ly1))
+                scx = (sx0 + sx1) / 2.0
+                if is_two_col:
+                    if col_x0 == 0.0:
+                        if not (scx < col_x1):
+                            continue
+                    else:
+                        if not (col_x0 <= scx <= col_x1):
+                            continue
+                col_spans.append(sp)
+
+            if not col_spans:
+                continue
+
+            text = "".join(sp.get("text", "") for sp in col_spans).strip()
+            if not text:
+                continue
+
+            sx0 = min(sp.get("bbox", (lx0, ly0, lx1, ly1))[0] for sp in col_spans)
+            sy0 = min(sp.get("bbox", (lx0, ly0, lx1, ly1))[1] for sp in col_spans)
+            sx1 = max(sp.get("bbox", (lx0, ly0, lx1, ly1))[2] for sp in col_spans)
+            sy1 = max(sp.get("bbox", (lx0, ly0, lx1, ly1))[3] for sp in col_spans)
+            max_font_size = max((sp.get("size", 0.0) for sp in col_spans), default=0.0)
+            is_bold = any(bool(sp.get("flags", 0) & 16) for sp in col_spans)
+            lines.append(
+                {
+                    "x0": sx0,
+                    "y0": sy0,
+                    "x1": sx1,
+                    "y1": sy1,
+                    "text": text,
+                    "font_size": max_font_size,
+                    "is_bold": is_bold,
+                }
+            )
+
+    lines.sort(key=lambda item: (round(item["y0"], 1), item["x0"]))
+    return lines
+
+
+def _collect_content_boxes_in_column(
+    page: pymupdf.Page,
+    page_dict: dict,
+    col_x0: float,
+    col_x1: float,
+    page_h: float,
+) -> list[tuple[float, float, float, float]]:
+    """정밀 크롭 경계 계산을 위해 컬럼 내 텍스트/이미지/도형 박스를 수집한다."""
+    boxes: list[tuple[float, float, float, float]] = []
+
+    for block in page_dict.get("blocks", []):
+        btype = block.get("type")
+        bx0, by0, bx1, by1 = block["bbox"]
+        if by1 < 0.035 * page_h or by0 > 0.94 * page_h:
+            continue
+
+        if btype == 0:
+            for ln in block.get("lines", []):
+                lx0, ly0, lx1, ly1 = ln["bbox"]
+                if ly1 < 0.035 * page_h or ly0 > 0.94 * page_h:
+                    continue
+                for sp in ln.get("spans", []):
+                    if not sp.get("text", "").strip():
+                        continue
+                    sx0, sy0, sx1, sy1 = sp.get("bbox", (lx0, ly0, lx1, ly1))
+                    scx = (sx0 + sx1) / 2.0
+                    if col_x0 <= scx <= col_x1:
+                        boxes.append((max(col_x0, sx0), sy0, min(col_x1, sx1), sy1))
+        else:
+            bcx = (bx0 + bx1) / 2.0
+            overlap_x = min(col_x1, bx1) - max(col_x0, bx0)
+            if (col_x0 <= bcx <= col_x1) or overlap_x > 16.0:
+                boxes.append((max(col_x0, bx0), by0, min(col_x1, bx1), by1))
+
+    for d in page.get_drawings():
+        rect = d.get("rect")
+        if not rect:
+            continue
+        rw = rect.x1 - rect.x0
+        rh = rect.y1 - rect.y0
+        if rh > 0.72 * page_h and rw < 6.0:
+            continue
+        if rw > 0.85 * page.rect.width:
+            continue
+        dcx = (rect.x0 + rect.x1) / 2.0
+        if not (col_x0 <= dcx <= col_x1):
+            continue
+        if rect.y1 < 0.04 * page_h or rect.y0 > 0.935 * page_h:
+            continue
+        boxes.append((max(col_x0, rect.x0), rect.y0, min(col_x1, rect.x1), rect.y1))
+
+    return boxes
+
+
+def _is_footer_or_header_noise(text: str, y0: float, page_h: float) -> bool:
+    # 본문 중앙에서 우연히 단어가 겹치는 오탐을 막기 위해 상·하단 여백 구간 위주로 필터링
+    in_margin = y0 < 0.11 * page_h or y0 > 0.91 * page_h
+    always_noise = (
+        "이 문제지에 관한 저작권",
+        "한국교육과정평가원",
+        "답안지의 해당란에",
+    )
+    if any(p in text for p in always_noise):
+        return True
+    if not in_margin:
+        return False
+    margin_noise = (
+        "학년도 대학수학능력시험",
+        "전국연합학력평가",
+        "모의평가 문제지",
+        "확인 사항",
+        "제 1 교시",
+        "제 2 교시",
+        "제 3 교시",
+        "제 4 교시",
+        "영역",
+    )
+    return any(p in text for p in margin_noise)
+
+
+def _stitch_vertical_pngs(top_png: bytes, bottom_png: bytes, gap_px: int = 12) -> tuple[bytes, int, int]:
+    """이전 단(컬럼)의 세트 지문 PNG와 문항 PNG를 위아래로 깔끔하게 이어 붙인다."""
+    with Image.open(io.BytesIO(top_png)) as im_top, Image.open(io.BytesIO(bottom_png)) as im_bot:
+        w = max(im_top.width, im_bot.width)
+        h = im_top.height + gap_px + im_bot.height
+        canvas = Image.new("RGB", (w, h), (255, 255, 255))
+        canvas.paste(im_top.convert("RGB"), (0, 0))
+        canvas.paste(im_bot.convert("RGB"), (0, im_top.height + gap_px))
+        buf = io.BytesIO()
+        canvas.save(buf, format="PNG")
+        return buf.getvalue(), w, h
+
+
+def parse_exam_pdf(pdf_bytes: bytes, dpi: int = 250) -> tuple[list[CroppedQuestion], bool]:
+    """
+    2단 편집 한국어 모의고사/수능 문제지 PDF를 PyMuPDF로 분석해
+    가로 중앙(page_width / 2) 기준 왼쪽 단(위->아래) 후 오른쪽 단(위->아래) 순서로
+    1번~45번 전체 문항 및 세트 지문([N~M])을 고해상도(>=220 DPI) PNG로 크롭한다.
+    """
+    effective_dpi = max(220, dpi)
+    results: list[CroppedQuestion] = []
+    seen_q_nums: set[int] = set()
+    total_text_chars = 0
+
+    # 이전 단(또는 이전 페이지) 끝에서 미처 첫 문항을 만나지 못한 세트 지문 [N~M] 이월용
+    carried_passage: dict | None = None
+
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page_idx in range(doc.page_count):
+            page = doc[page_idx]
+            page_h = page.rect.height
+            page_w = page.rect.width
+            page_dict = page.get_text("dict")
+            total_text_chars += len(re.sub(r"\s+", "", page.get_text("text") or ""))
+
+            columns = _detect_columns(page)
+
+            for col_x0, col_x1 in columns:
+                col_w = col_x1 - col_x0
+                lines = _extract_lines_in_column(page_dict, col_x0, col_x1, page_h, page_w)
+                if not lines:
+                    continue
+
+                # 컬럼 본문의 좌측 시작 기준 (과도한 좌측 여백 노이즈 방지를 위해 중앙값/대다수 기준 보조)
+                candidate_xs = sorted(
+                    ln["x0"]
+                    for ln in lines
+                    if not _is_footer_or_header_noise(ln["text"], ln["y0"], page_h)
+                    and QUESTION_START_RE.match(ln["text"])
+                )
+                ref_q_x0 = candidate_xs[0] if candidate_xs else (col_x0 + 24.0)
+                max_allowed_x0 = max(col_x0 + 0.34 * col_w, ref_q_x0 + 48.0)
+
+                markers: list[dict] = []
+                pending_passage_y0: float | None = None
+                pending_passage_end_q: int | None = None
+
+                for ln in lines:
+                    txt = ln["text"]
+                    if _is_footer_or_header_noise(txt, ln["y0"], page_h):
+                        continue
+
+                    # 공통/세트 지문 헤더 [1~3], [16~17], [41~42] 등 감지
+                    pm = SHARED_PASSAGE_RE.match(txt)
+                    if pm and ln["x0"] <= col_x0 + 0.45 * col_w:
+                        p_start = int(pm.group(1))
+                        p_end = int(pm.group(2))
+                        if 1 <= p_start <= p_end <= 45:
+                            pending_passage_y0 = ln["y0"]
+                            pending_passage_end_q = p_end
+                        continue
+
+                    qm = QUESTION_START_RE.match(txt)
+                    if not qm:
+                        continue
+                    q_num = int(qm.group(1))
+                    if not (1 <= q_num <= 45):
+                        continue
+
+                    if ln["x0"] > max_allowed_x0:
+                        continue
+
+                    # 좌->우, 위->아래 순차 탐색 중 중복 번호 및 역순 오탐(<보기> 내부 숫자 등) 방지
+                    if q_num in seen_q_nums:
+                        continue
+                    if seen_q_nums and q_num < max(seen_q_nums):
+                        continue
+
+                    start_y = ln["y0"]
+                    if (
+                        pending_passage_y0 is not None
+                        and pending_passage_end_q is not None
+                        and q_num <= pending_passage_end_q
+                    ):
+                        start_y = min(start_y, pending_passage_y0)
+                        pending_passage_y0 = None
+                        pending_passage_end_q = None
+
+                    markers.append(
+                        {
+                            "q_num": q_num,
+                            "y_start": start_y,
+                            "anchor_y": ln["y0"],
+                        }
+                    )
+                    seen_q_nums.add(q_num)
+
+                content_boxes = _collect_content_boxes_in_column(
+                    page, page_dict, col_x0, col_x1, page_h
+                )
+
+                # 현재 단에 [N~M] 지문만 있고 문항이 없다면(또는 마지막 문항 아래에 새 지문이 있다면) 다음 단으로 이월
+                if pending_passage_y0 is not None and pending_passage_end_q is not None:
+                    p_bottom = 0.93 * page_h
+                    p_boxes = [
+                        b
+                        for b in content_boxes
+                        if b[3] > pending_passage_y0 - 4.0 and b[1] < p_bottom
+                    ]
+                    if p_boxes:
+                        p_clip = pymupdf.Rect(
+                            max(col_x0 + 2.0, min(b[0] for b in p_boxes) - 10.0),
+                            max(8.0, min(pending_passage_y0, min(b[1] for b in p_boxes)) - 6.0),
+                            min(col_x1 - 2.0, max(b[2] for b in p_boxes) + 10.0),
+                            min(0.935 * page_h, max(b[3] for b in p_boxes) + 10.0),
+                        )
+                        p_pix = page.get_pixmap(dpi=effective_dpi, clip=p_clip, alpha=False)
+                        p_txt = "\n".join(
+                            ln["text"]
+                            for ln in lines
+                            if ln["y1"] >= p_clip.y0 and ln["y0"] <= p_clip.y1
+                        )
+                        carried_passage = {
+                            "end_q": pending_passage_end_q,
+                            "png_bytes": p_pix.tobytes("png"),
+                            "text": p_txt,
+                        }
+
+                if not markers:
+                    continue
+
+                for i, marker in enumerate(markers):
+                    is_last_in_col = i == len(markers) - 1
+                    trailing_passage_cuts_col = (
+                        is_last_in_col
+                        and pending_passage_y0 is not None
+                        and pending_passage_y0 > marker["y_start"]
+                    )
+                    y_top_limit = marker["y_start"] - 4.0
+                    if not is_last_in_col:
+                        y_bottom_limit = markers[i + 1]["y_start"] - 4.0
+                    elif trailing_passage_cuts_col:
+                        y_bottom_limit = pending_passage_y0 - 4.0
+                    else:
+                        # 각 단 맨 아래 문항은 쪽번호/저작권 위쪽 약 0.93*H까지 넉넉히 확보
+                        y_bottom_limit = 0.93 * page_h
+
+                    matched_boxes = [
+                        b
+                        for b in content_boxes
+                        if b[3] > y_top_limit and b[1] < y_bottom_limit and b[1] >= y_top_limit - 8.0
+                    ]
+
+                    if matched_boxes:
+                        min_x = min(b[0] for b in matched_boxes)
+                        min_y = min(marker["y_start"], min(b[1] for b in matched_boxes))
+                        max_x = max(b[2] for b in matched_boxes)
+                        max_y = max(b[3] for b in matched_boxes)
+                    else:
+                        min_x = max(col_x0, col_x0 + 18.0)
+                        min_y = marker["y_start"]
+                        max_x = col_x1 - 8.0
+                        max_y = y_bottom_limit
+
+                    if is_last_in_col and not trailing_passage_cuts_col:
+                        max_y = max(max_y, 0.93 * page_h)
+                    elif max_y - min_y < 40.0:
+                        max_y = min(y_bottom_limit, min_y + 120.0)
+
+                    pad_x = 12.0
+                    pad_y = 8.0
+                    clip = pymupdf.Rect(
+                        max(col_x0 + 2.0, min_x - pad_x),
+                        max(8.0, min_y - pad_y),
+                        min(col_x1 - 2.0, max_x + pad_x),
+                        min(
+                            0.935 * page_h if is_last_in_col else y_bottom_limit,
+                            max_y + pad_y,
+                        ),
+                    )
+                    if clip.y1 <= clip.y0:
+                        clip.y1 = min(0.935 * page_h, clip.y0 + 120.0)
+
+                    if clip.width < 0.30 * page_w:
+                        clip.x0 = max(col_x0 + 4.0, col_x0 + 12.0)
+                        clip.x1 = min(col_x1 - 4.0, max(clip.x1, col_x1 - 16.0))
+
+                    pix = page.get_pixmap(dpi=effective_dpi, clip=clip, alpha=False)
+                    png_out = pix.tobytes("png")
+                    out_w, out_h = pix.width, pix.height
+                    q_text = "\n".join(
+                        ln["text"]
+                        for ln in lines
+                        if ln["y1"] >= clip.y0 and ln["y0"] <= clip.y1
+                    )
+
+                    # 직전 단에서 이월된 세트 지문이 현재 문항 번호를 포함하면 상단에 결합
+                    if carried_passage is not None and marker["q_num"] <= carried_passage["end_q"]:
+                        png_out, out_w, out_h = _stitch_vertical_pngs(
+                            carried_passage["png_bytes"],
+                            png_out,
+                        )
+                        if carried_passage.get("text"):
+                            q_text = f"{carried_passage['text']}\n\n{q_text}".strip()
+                        carried_passage = None
+                    elif carried_passage is not None and marker["q_num"] > carried_passage["end_q"]:
+                        carried_passage = None
+
+                    results.append(
+                        CroppedQuestion(
+                            q_num=marker["q_num"],
+                            page_num=page_idx + 1,
+                            png_bytes=png_out,
+                            width=out_w,
+                            height=out_h,
+                            extracted_text=q_text,
+                        )
+                    )
+
+    results.sort(key=lambda r: r.q_num)
+    has_text_layer = total_text_chars >= 60
+    return results, has_text_layer
+
+
+def crop_normalized_box(
+    pdf_bytes: bytes,
+    page_num: int,
+    ymin: int,
+    xmin: int,
+    ymax: int,
+    xmax: int,
+    dpi: int = 250,
+) -> tuple[bytes, int, int]:
+    """0~1000 정규화 좌표를 이용해 스캔 PDF 페이지를 고해상도 크롭한다."""
+    effective_dpi = max(220, dpi)
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        page = doc[max(0, min(page_num - 1, doc.page_count - 1))]
+        w, h = page.rect.width, page.rect.height
+        clip = pymupdf.Rect(
+            max(0.0, (xmin / 1000.0) * w - 6.0),
+            max(0.0, (ymin / 1000.0) * h - 6.0),
+            min(w, (xmax / 1000.0) * w + 6.0),
+            min(h, (ymax / 1000.0) * h + 6.0),
+        )
+        pix = page.get_pixmap(dpi=effective_dpi, clip=clip, alpha=False)
+        return pix.tobytes("png"), pix.width, pix.height
+
+
+_ANS_LINE_MARKER_RE = re.compile(r"^(?:\[?\s*(\d{1,2})\s*\]?\s*[.)번]|\[\s*(\d{1,2})\s*\])\s*(.*)$")
+
+
+def extract_answer_snippets_from_pdf(pdf_bytes: bytes, max_chars_per_q: int = 1200) -> tuple[dict[int, str], bool]:
+    """
+    텍스트 레이어가 있는 해설지 PDF에서 문항 번호별 해설 텍스트 스니펫을 빠르게 추출한다.
+    문항마다 전체 해설지 PDF 바이너리를 반복 전송하지 않도록 경량화하는 데 사용한다.
+    """
+    full_lines: list[str] = []
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for i in range(doc.page_count):
+            txt = (doc[i].get_text("text") or "").strip()
+            if txt:
+                full_lines.extend(ln.strip() for ln in txt.splitlines() if ln.strip())
+
+    joined_len = sum(len(x) for x in full_lines)
+    if joined_len < 20:
+        return {}, False
+
+    snippets: dict[int, list[str]] = {}
+    cur_q: int | None = None
+    for ln in full_lines:
+        m = _ANS_LINE_MARKER_RE.match(ln)
+        if m:
+            q_str = m.group(1) or m.group(2)
+            if q_str:
+                q_num = int(q_str)
+                if 1 <= q_num <= 45:
+                    cur_q = q_num
+                    snippets.setdefault(cur_q, []).append(ln)
+                    continue
+        if cur_q is not None:
+            snippets[cur_q].append(ln)
+
+    out: dict[int, str] = {}
+    for q_num, parts in snippets.items():
+        merged = "\n".join(parts).strip()
+        if merged:
+            out[q_num] = merged[:max_chars_per_q]
+    return out, True

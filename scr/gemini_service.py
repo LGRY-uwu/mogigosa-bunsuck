@@ -1,0 +1,826 @@
+from __future__ import annotations
+
+import io
+import random
+import time
+from typing import Any, Callable, TypeVar
+
+from google import genai
+from google.genai import types
+from PIL import Image
+from pydantic import BaseModel, Field
+
+from src.config import DEFAULT_MODEL, HYDROGEN_MODEL, resolve_api_model_name
+from src.models import (
+    BatchMatchResult,
+    ConceptWhitelist,
+    ExamHeaderMetadata,
+    QuestionExtractionOutput,
+    QuestionMatchJudgment,
+    QuestionRecord,
+    RewrittenQuestion,
+)
+
+T = TypeVar("T")
+
+
+class ScannedBox(BaseModel):
+    q_num: int = Field(..., ge=1, le=50)
+    ymin: int = Field(..., ge=0, le=1000)
+    xmin: int = Field(..., ge=0, le=1000)
+    ymax: int = Field(..., ge=0, le=1000)
+    xmax: int = Field(..., ge=0, le=1000)
+
+
+class ScannedPageBoxes(BaseModel):
+    boxes: list[ScannedBox] = Field(default_factory=list)
+
+
+DEFAULT_API_TIMEOUT_SECONDS: int = 30
+MAX_VISION_IMAGE_WIDTH: int = 1200
+
+
+def _build_client(api_key: str, timeout_seconds: int = DEFAULT_API_TIMEOUT_SECONDS) -> genai.Client:
+    if not api_key or not api_key.strip():
+        raise ValueError("API 키가 설정되지 않았습니다. 사이드바 또는 Secrets에 Gemini API 키를 입력해 주세요.")
+    timeout_ms = max(5, int(timeout_seconds)) * 1000
+    return genai.Client(
+        api_key=api_key.strip(),
+        http_options=types.HttpOptions(
+            timeout=timeout_ms,
+            # SDK 내부의 5회 지수 백오프 무한 대기 차단 -> 명시적 최대 2회 제어
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+
+def build_gemini_client(api_key: str, timeout_seconds: int = DEFAULT_API_TIMEOUT_SECONDS) -> genai.Client:
+    """외부 호출부에서 30초 타임아웃이 적용된 Gemini 클라이언트를 생성할 때 사용한다."""
+    return _build_client(api_key, timeout_seconds=timeout_seconds)
+
+
+def optimize_image_for_vision(png_bytes: bytes, max_width: int = MAX_VISION_IMAGE_WIDTH) -> bytes:
+    """Gemini Vision 전송/처리 속도 최적화를 위해 가로 최대 1200px 이하로 비례 리사이징 및 압축한다."""
+    if not png_bytes:
+        return png_bytes
+    with Image.open(io.BytesIO(png_bytes)) as img:
+        if img.width <= max_width:
+            if len(png_bytes) <= 450 * 1024:
+                return png_bytes
+            out = io.BytesIO()
+            img.save(out, format="PNG", optimize=True)
+            return out.getvalue()
+
+        new_h = max(1, int(round(img.height * (max_width / img.width))))
+        resized = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+        out = io.BytesIO()
+        resized.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+
+
+FALLBACK_MODEL_ORDER: tuple[str, ...] = (
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+)
+RATE_LIMIT_FALLBACK_ORDER: tuple[str, ...] = (
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+)
+OVERLOAD_RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 6.0)
+
+
+def build_model_fallback_chain(model_name: str) -> list[str]:
+    """주 모델에서 503 등이 반복될 경우 순차 전환할 폴백 모델 체인을 구성한다."""
+    primary = resolve_api_model_name(model_name) or DEFAULT_MODEL
+    return [primary] + [m for m in FALLBACK_MODEL_ORDER if m != primary]
+
+
+def _is_fatal_config_or_auth_error(msg: str) -> bool:
+    return any(
+        k in msg
+        for k in (
+            "400",
+            "401",
+            "403",
+            "invalid_argument",
+            "permission_denied",
+            "unauthenticated",
+            "api key not valid",
+            "api_key_invalid",
+        )
+    )
+
+
+def _is_rate_limit_error(msg: str) -> bool:
+    return any(
+        k in msg
+        for k in (
+            "429",
+            "resource_exhausted",
+            "rate limit",
+            "rate_limit",
+            "quota",
+        )
+    )
+
+
+def _is_server_overload_error(msg: str) -> bool:
+    return any(
+        k in msg
+        for k in (
+            "503",
+            "unavailable",
+            "high demand",
+            "overloaded",
+        )
+    )
+
+
+def _is_model_not_found_error(msg: str) -> bool:
+    return any(k in msg for k in ("404", "not_found", "not found"))
+
+
+def _is_timeout_error(msg: str) -> bool:
+    return any(k in msg for k in ("504", "deadline", "timeout"))
+
+
+def _call_with_retry(fn: Callable[[], T], max_retries: int = 3) -> T:
+    """503 일시 과부하는 지수 백오프(2→4→6초+지터)로 재시도하고 400/401/403/429은 즉시 반환한다."""
+    max_overload_retries = min(len(OVERLOAD_RETRY_DELAYS), max(0, max_retries))
+    last_err: Exception | None = None
+    for attempt in range(max_overload_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc).lower()
+            if _is_fatal_config_or_auth_error(msg) or _is_rate_limit_error(msg):
+                raise
+            if _is_server_overload_error(msg) and attempt < max_overload_retries:
+                wait_s = OVERLOAD_RETRY_DELAYS[attempt] + random.uniform(0.1, 0.7)
+                time.sleep(wait_s)
+                continue
+            if _is_timeout_error(msg) and attempt == 0 and max_overload_retries > 0:
+                time.sleep(0.5)
+                continue
+            raise
+    assert last_err is not None
+    raise last_err
+
+
+def _with_thinking_config(
+    config: types.GenerateContentConfig | None,
+    thinking_config: types.ThinkingConfig,
+) -> types.GenerateContentConfig:
+    if config is None:
+        return types.GenerateContentConfig(thinking_config=thinking_config)
+    return config.model_copy(update={"thinking_config": thinking_config})
+
+
+def _clone_config_for_model(
+    config: types.GenerateContentConfig | None,
+    cand_model: str,
+    fast_mode: bool = False,
+) -> types.GenerateContentConfig | None:
+    resolved_model = resolve_api_model_name(cand_model)
+    if resolved_model == HYDROGEN_MODEL:
+        if config is not None and getattr(config, "thinking_config", None) is not None:
+            return config
+        return _with_thinking_config(
+            config,
+            types.ThinkingConfig(thinking_level="LOW"),
+        )
+
+    if config is None:
+        return None
+    if not fast_mode:
+        return config
+    is_lite = "lite" in resolved_model.lower()
+    if is_lite:
+        # lite 모델은 thinking_budget=0 전달 시 400 INVALID_ARGUMENT가 발생할 수 있어 thinking_config 미지정
+        return config
+    if getattr(config, "thinking_config", None) is not None:
+        return config
+    return _with_thinking_config(
+        config,
+        types.ThinkingConfig(thinking_budget=0),
+    )
+
+
+def _generate_content_with_fallback(
+    client: genai.Client,
+    model_name: str,
+    contents: Any,
+    config: types.GenerateContentConfig | None = None,
+    fast_mode: bool = False,
+    status_callback: Callable[[str], None] | None = None,
+) -> Any:
+    """
+    - 429 RESOURCE_EXHAUSTED: 대기 없이 별도 할당량 보조 모델(gemini-3.5-flash → gemini-3.5-flash-lite)로 즉시 우회
+    - 503 UNAVAILABLE/혼잡: 동일 모델 최대 3회(2s→4s→6s+지터) 재시도 후 폴백 체인 순차 전환
+    - 400/401/403 설정·권한 오류: 재시도/폴백 없이 즉시 실패
+    """
+    attempt_models = build_model_fallback_chain(model_name)
+
+    last_err: Exception | None = None
+    idx = 0
+    while idx < len(attempt_models):
+        cand_model = attempt_models[idx]
+        max_overload_retries = len(OVERLOAD_RETRY_DELAYS) if idx == 0 else 1
+        has_next_model = idx < len(attempt_models) - 1
+        next_idx = idx + 1
+
+        for overload_attempt in range(max_overload_retries + 1):
+            if status_callback is not None:
+                status_callback(
+                    f"Gemini API 호출 중 (모델: {cand_model}, 체인 {idx + 1}/{len(attempt_models)}, "
+                    f"시도 {overload_attempt + 1}/{max_overload_retries + 1}, 타임아웃 30초)..."
+                )
+            try:
+                eff_cfg = _clone_config_for_model(config, cand_model, fast_mode=fast_mode)
+                return client.models.generate_content(
+                    model=cand_model,
+                    contents=contents,
+                    config=eff_cfg,
+                )
+            except Exception as exc:
+                last_err = exc
+                msg = str(exc).lower()
+                # thinking_config 미지원 400 오류 시 최소 thinking_budget 또는 기본 config로 복구 시도
+                if "thinking" in msg and "400" in msg:
+                    recovery_configs: list[types.GenerateContentConfig | None] = []
+                    if cand_model == HYDROGEN_MODEL:
+                        recovery_configs.append(
+                            _with_thinking_config(config, types.ThinkingConfig(thinking_budget=256))
+                        )
+                    if config is not None or cand_model == HYDROGEN_MODEL:
+                        recovery_configs.append(config)
+                    for rec_cfg in recovery_configs:
+                        try:
+                            return client.models.generate_content(
+                                model=cand_model,
+                                contents=contents,
+                                config=rec_cfg,
+                            )
+                        except Exception as exc2:
+                            last_err = exc2
+                            msg = str(exc2).lower()
+
+                # 설정·인증·권한 오류(400/401/403)는 재시도 및 모델 전환 없이 즉시 중단
+                if _is_fatal_config_or_auth_error(msg):
+                    raise last_err
+
+                # 429 할당량 초과: 대기 없이 별도 할당량 모델(gemini-3.5-flash → gemini-3.5-flash-lite)로 즉시 우회
+                if _is_rate_limit_error(msg):
+                    jump_candidates = [
+                        j
+                        for j in range(idx + 1, len(attempt_models))
+                        if attempt_models[j] in RATE_LIMIT_FALLBACK_ORDER
+                    ]
+                    if jump_candidates:
+                        next_idx = jump_candidates[0]
+                    elif has_next_model:
+                        next_idx = idx + 1
+                    else:
+                        raise last_err
+
+                    if status_callback is not None:
+                        status_callback(
+                            f"⚡ {cand_model} 할당량 초과(429) → 대기 없이 {attempt_models[next_idx]}(으)로 즉시 우회..."
+                        )
+                    break
+
+                # 503 서버 혼잡: 2s → 4s → 6s (+지터) 재시도 후 다음 모델로 전환
+                if _is_server_overload_error(msg):
+                    if overload_attempt < max_overload_retries:
+                        base_wait = OVERLOAD_RETRY_DELAYS[
+                            min(overload_attempt, len(OVERLOAD_RETRY_DELAYS) - 1)
+                        ]
+                        wait_s = round(base_wait + random.uniform(0.1, 0.7), 2)
+                        if status_callback is not None:
+                            status_callback(
+                                f"⚠️ {cand_model} 503 혼잡 · {wait_s:.1f}초 후 재시도 "
+                                f"({overload_attempt + 1}/{max_overload_retries})..."
+                            )
+                        time.sleep(wait_s)
+                        continue
+                    if has_next_model:
+                        next_idx = idx + 1
+                        if status_callback is not None:
+                            status_callback(
+                                f"🔀 {cand_model} 503 지속 → 보조 모델 {attempt_models[next_idx]}(으)로 전환..."
+                            )
+                        break
+                    raise last_err
+
+                if _is_model_not_found_error(msg) and has_next_model:
+                    next_idx = idx + 1
+                    if status_callback is not None:
+                        status_callback(
+                            f"🔀 {cand_model} 미지원(404) → 보조 모델 {attempt_models[next_idx]}(으)로 전환..."
+                        )
+                    break
+
+                if _is_timeout_error(msg) and has_next_model:
+                    next_idx = idx + 1
+                    time.sleep(0.5)
+                    break
+
+                raise last_err
+
+        idx = next_idx
+
+    assert last_err is not None
+    raise last_err
+
+
+def _parse_structured(response: Any, schema_cls: type[T]) -> T:
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, schema_cls):
+        return parsed
+    text = getattr(response, "text", None) or ""
+    if not text.strip():
+        raise RuntimeError("Gemini 응답이 비어 있습니다. 모델 이름 또는 입력 데이터를 확인해 주세요.")
+    return schema_cls.model_validate_json(text)
+
+
+def prepare_pdf_part(client: genai.Client, pdf_bytes: bytes, display_name: str = "document.pdf") -> Any:
+    """PDF가 12MB를 넘으면 Gemini File API로 업로드하고, 작으면 인라인 Part.from_bytes를 사용한다."""
+    if len(pdf_bytes) <= 12 * 1024 * 1024:
+        return types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+
+    uploaded = _call_with_retry(
+        lambda: client.files.upload(
+            file=io.BytesIO(pdf_bytes),
+            config=types.UploadFileConfig(
+                mime_type="application/pdf",
+                display_name=display_name,
+            ),
+        )
+    )
+    # PROCESSING 상태 대기
+    for _ in range(20):
+        state_name = getattr(getattr(uploaded, "state", None), "name", "")
+        if state_name != "PROCESSING":
+            break
+        time.sleep(1.0)
+        uploaded = client.files.get(name=uploaded.name)
+    return uploaded
+
+
+def detect_scanned_question_boxes(
+    api_key: str,
+    model_name: str,
+    page_png_bytes: bytes,
+) -> list[ScannedBox]:
+    """텍스트 레이어가 없는 스캔 PDF 페이지에서 문항 좌표를 Gemini Vision으로 탐지한다."""
+    client = _build_client(api_key)
+    prompt = (
+        "이 한국어 시험지 단일 페이지 이미지를 **왼쪽 단(xmin < 500) 위→아래** 순서로 먼저 훑고, "
+        "이어서 **오른쪽 단(xmin >= 500) 위→아래** 순서로 탐색하여 이 페이지에 있는 모든 문항(1~45번 전체, 누락 없이)을 찾으세요.\n"
+        "- 각 문항의 경계 상자 [ymin, xmin, ymax, xmax]를 0~1000 정규화 좌표로 반환하세요.\n"
+        "- 문항 본문, 그림/표, <보기>, 선지 ①~⑤ 전체가 포함되도록 하세요.\n"
+        "- 세트/공통 지문 헤더(`[1~3]`, `[16~17]` 등)가 바로 위 또는 같은 단 상단에 있으면 해당 첫 문항 상자에 포함하세요.\n"
+        "- 각 단의 맨 아래 문항은 선지 ④, ⑤가 잘리지 않도록 페이지 하단 여백 위쪽(`ymax` 약 930)까지 넉넉히 잡으세요."
+    )
+    opt_png = optimize_image_for_vision(page_png_bytes)
+    img_part = types.Part.from_bytes(data=opt_png, mime_type="image/png")
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=[img_part, prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ScannedPageBoxes,
+            temperature=0.0,
+        ),
+        fast_mode=True,
+    )
+    result = _parse_structured(resp, ScannedPageBoxes)
+    return result.boxes
+
+
+def analyze_question_with_gemini(
+    api_key: str,
+    model_name: str,
+    crop_png_bytes: bytes,
+    q_num: int,
+    subject_category: str,
+    exam_name: str,
+    answer_pdf_part: Any | None = None,
+    answer_text_hint: str = "",
+    status_callback: Callable[[str], None] | None = None,
+) -> QuestionExtractionOutput:
+    """
+    크롭된 문항 PNG(가로 최대 1200px 리사이즈)와 해설지 정보(스니펫 또는 PDF)를 Gemini에 전달해
+    2022 개정 교육과정 기준 본질적 원리(core_principles)와 표면 용어(required_terms)를 빠르게 추출한다.
+    """
+    client = _build_client(api_key, timeout_seconds=DEFAULT_API_TIMEOUT_SECONDS)
+    if status_callback is not None:
+        status_callback(f"{q_num}번 이미지 최적화 중(≤1200px)...")
+    opt_png = optimize_image_for_vision(crop_png_bytes)
+    img_part = types.Part.from_bytes(data=opt_png, mime_type="image/png")
+
+    system_inst = (
+        "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가입니다. "
+        "반드시 '본질적 풀이 원리(core_principles)'와 '문제에 사용된 표면적 전문 용어·단위(required_terms)'를 "
+        "명확히 분리하여 태깅해야 합니다.\n"
+        "- core_principles: 상위 과목의 포장된 용어를 걷어내고, 이 문제를 실제로 풀기 위해 필요한 근본적 원리/법칙을 "
+        "간결한 한국어 개념구로 나열하세요. (예: '몰농도' 문제를 비례식과 질량 보존으로 풀 수 있다면 '비례 관계', '질량 보존 법칙' 등을 포함)\n"
+        "- required_terms: 실제 문제 지문, 그림, 표, 보기에 등장하는 전문 용어·기호·단위를 빠짐없이 적으세요. "
+        "(예: ['mol', '몰농도', 'M'], ['한계효용', '무차별곡선'], ['정적분', '도함수'])\n"
+        "- min_grade: 이 문항의 core_principles를 2022 개정 교육과정에서 처음 학습하는 최저 학년 (반드시 1, 2, 3 정수: 1=고1, 2=고2, 3=고3). "
+        "용어가 고2/고3 수준이더라도 본질 원리가 고1 통합과학·통합사회·공통수학에서 해결 가능하면 min_grade=1로 판정할 수 있습니다.\n"
+        "- answer: 해설지 참고 내용이나 첨부된 해설지 PDF에서 해당 문항 번호의 공식 정답을 정확히 찾고, 객관식은 '1'~'5' 숫자만, 주관식은 값만 적으세요."
+    )
+
+    hint_block = (
+        f"\n[해설지 {q_num}번 발췌]\n{answer_text_hint.strip()}\n"
+        if answer_text_hint and answer_text_hint.strip()
+        else ""
+    )
+    prompt = (
+        f"시험 회차: {exam_name}\n"
+        f"대분류 과목: {subject_category}\n"
+        f"문항 번호: {q_num}번\n"
+        f"{hint_block}\n"
+        "위 이미지의 문항을 분석하고 공식 정답·해설을 참고하여 JSON 스키마에 맞게 간결히 추출하세요."
+    )
+
+    contents: list[Any] = [img_part]
+    if answer_pdf_part is not None and not hint_block:
+        contents.append(answer_pdf_part)
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=QuestionExtractionOutput,
+            temperature=0.1,
+        ),
+        fast_mode=True,
+        status_callback=status_callback,
+    )
+    if status_callback is not None:
+        status_callback(f"{q_num}번 응답 파싱 중...")
+    return _parse_structured(resp, QuestionExtractionOutput)
+
+
+def extract_concept_whitelist(
+    api_key: str,
+    model_name: str,
+    sliced_pdf_bytes: bytes,
+    sliced_text: str,
+    start_page: int,
+    end_page: int,
+) -> ConceptWhitelist:
+    """업로드된 개념서·교과서 PDF 지정 페이지 범위에서 허용 개념과 허용 용어 화이트리스트를 추출한다."""
+    client = _build_client(api_key)
+    pdf_part = prepare_pdf_part(client, sliced_pdf_bytes, display_name="concept_slice.pdf")
+
+    system_inst = (
+        "당신은 엄격한 교육과정 범위 검증관입니다. "
+        "첨부된 개념서/교과서 PDF 페이지에 **실제로 설명되어 있는 내용만** 추출해야 합니다. "
+        "뒤 단원이나 상위 과목에 나오는 개념·용어를 절대 추측하거나 추가하지 마세요.\n"
+        "1. pdf_concepts: 이 페이지 범위에서 실제로 설명·정의·예시된 개념, 원리, 법칙, 계산 방법을 빠짐없이 나열하세요.\n"
+        "2. pdf_vocabulary: 이 페이지 범위 본문, 그림, 표, 공식, 용어 사전 박스에 실제로 등장하는 "
+        "모든 교과 용어, 기호, 단위를 나열하세요."
+    )
+
+    excerpt = sliced_text[:12000] if sliced_text else "(이미지 중심 PDF)"
+    prompt = (
+        f"대상 PDF 페이지 범위: {start_page}쪽 ~ {end_page}쪽\n"
+        "첨부된 PDF 페이지(텍스트 및 그림·도표 포함)를 정독한 뒤, "
+        "이 페이지 범위 안에 실제로 존재하는 개념·원리(pdf_concepts)와 허용 용어(pdf_vocabulary)만 추출하세요.\n\n"
+        f"[보조 추출 텍스트]\n{excerpt}"
+    )
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=[pdf_part, prompt],
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=ConceptWhitelist,
+            temperature=0.0,
+        ),
+    )
+    return _parse_structured(resp, ConceptWhitelist)
+
+
+def match_questions_to_whitelist(
+    api_key: str,
+    model_name: str,
+    candidates: list[QuestionRecord],
+    whitelist: ConceptWhitelist,
+) -> list[QuestionMatchJudgment]:
+    """후보 기출 문항들의 core_principles가 PDF pdf_concepts 범위만으로 해결 가능한지 엄격히 판정한다."""
+    if not candidates:
+        return []
+
+    client = _build_client(api_key)
+    system_inst = (
+        "당신은 기출 문항과 개념서 PDF 범위의 정합성을 판정하는 엄격한 심사관입니다.\n"
+        "판정 규칙:\n"
+        "1. is_solvable_by_pdf_only: 문항의 core_principles와 실제 풀이(official_explanation)가 "
+        "업로드된 PDF의 pdf_concepts 범위(및 초중등 기초 연산·독해)만으로 **100% 완전히 해결 가능**할 때만 True로 판정하세요. "
+        "PDF에 없는 다른 단원의 원리가 하나라도 필요하면 반드시 False로 판정하세요.\n"
+        "2. out_of_scope_terms: 문항의 required_terms 중 pdf_vocabulary에 없는 상위/범위 외 전문 용어·단위를 적으세요. "
+        "(기초 일상어나 '개', '%', '초', 'm', 'g' 등 보편적 기초 단위는 제외 가능하나, 상위 전공 용어나 기호는 반드시 포함)\n"
+        "3. needs_rewriting: is_solvable_by_pdf_only가 True이고 out_of_scope_terms가 1개 이상이면 True, "
+        "용어까지 모두 PDF 범위 안이면 False입니다."
+    )
+
+    all_judgments: list[QuestionMatchJudgment] = []
+    batch_size = 12
+
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i : i + batch_size]
+        cand_lines = []
+        for q in batch:
+            cand_lines.append(
+                f"- question_id: {q.id}\n"
+                f"  과목/단원: {q.subject_category} / {q.curriculum_subject} / {q.unit_name} (최저학년: 고{q.min_grade})\n"
+                f"  core_principles: {q.core_principles}\n"
+                f"  required_terms: {q.required_terms}\n"
+                f"  official_explanation: {q.official_explanation}"
+            )
+
+        prompt = (
+            f"[업로드된 PDF 요약]\n{whitelist.pdf_summary}\n\n"
+            f"[PDF 허용 개념·원리 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
+            f"[PDF 허용 용어 목록 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
+            "[평가할 기출 문항 목록]\n" + "\n".join(cand_lines)
+        )
+
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_inst,
+                response_mime_type="application/json",
+                response_schema=BatchMatchResult,
+                temperature=0.0,
+            ),
+        )
+        batch_res = _parse_structured(resp, BatchMatchResult)
+        all_judgments.extend(batch_res.judgments)
+
+    return all_judgments
+
+
+def rewrite_question_for_pdf(
+    api_key: str,
+    model_name: str,
+    question: QuestionRecord,
+    crop_png_bytes: bytes | None,
+    whitelist: ConceptWhitelist,
+    out_of_scope_terms: list[str],
+    sliced_text: str = "",
+) -> RewrittenQuestion:
+    """
+    풀이 원리는 PDF 범위 안이지만 상위 과목 용어(out_of_scope_terms)가 포함된 문항을
+    업로드된 PDF에 실제로 존재하는 용어와 개념 표현만 사용해 자연스럽게 개조한다.
+    문제의 논리와 정답은 원본과 100% 동일하게 유지한다.
+    """
+    client = _build_client(api_key)
+
+    system_inst = (
+        "당신은 고난도 교육과정 기반 문항 리라이터(PDF-Grounded Rewriter)입니다.\n"
+        "다음 절대 원칙을 반드시 지키세요:\n"
+        "1. 업로드된 개념서 PDF에 있는 개념(pdf_concepts)과 용어(pdf_vocabulary), 그리고 일반 일상 한국어만 사용하세요.\n"
+        "2. 범위 외 상위 용어 목록(out_of_scope_terms)에 포함된 단어나 기호는 개조된 지문, <조건>, 선지, 해설 어디에도 절대 남기지 마세요.\n"
+        "3. 문제의 수학적·논리적 구조, 수치 조건, 정답의 참/거짓 판정 로직은 원본과 **100% 동일하게** 유지하세요.\n"
+        "4. preserved_answer는 반드시 원본 정답과 동일해야 합니다.\n"
+        "5. 그림이나 표에 있던 필수 수치가 있다면 지문 또는 <조건>에 PDF 허용 용어로 빠짐없이 명시해 텍스트만 읽어도 풀 수 있게 하세요.\n"
+        "6. rewritten_choices는 객관식이면 5개 항목 리스트(선지 번호 ①~⑤는 빼고 내용만), 주관식이면 빈 리스트 []로 반환하세요."
+    )
+
+    context_excerpt = sliced_text[:6000] if sliced_text else ""
+    prompt = (
+        f"[원본 문항 정보]\n"
+        f"- ID: {question.id} ({question.exam_name} {question.q_num}번)\n"
+        f"- 본질 원리: {question.core_principles}\n"
+        f"- 원본 정답: {question.answer}\n"
+        f"- 원본 공식 해설 요약: {question.official_explanation}\n"
+        f"- 반드시 제거·치환해야 할 범위 외 상위 용어: {out_of_scope_terms}\n\n"
+        f"[업로드된 PDF 허용 개념 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
+        f"[업로드된 PDF 허용 용어 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
+        f"[업로드된 PDF 본문 참고 발췌]\n{context_excerpt}\n\n"
+        "위 원본 문항 이미지를 보고, 범위 외 상위 용어를 PDF 내부 표현으로 자연스럽게 치환한 '변형 문제 카드'와 'PDF 맞춤 해설'을 작성하세요."
+    )
+
+    contents: list[Any] = []
+    if crop_png_bytes:
+        contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=RewrittenQuestion,
+            temperature=0.2,
+        ),
+        fast_mode=True,
+    )
+    rewritten = _parse_structured(resp, RewrittenQuestion)
+    # 정답 보존 강제 검증
+    rewritten.preserved_answer = question.answer
+    return rewritten
+
+
+def generate_pdf_grounded_explanation(
+    api_key: str,
+    model_name: str,
+    question: QuestionRecord,
+    crop_png_bytes: bytes | None,
+    whitelist: ConceptWhitelist,
+    user_answer: str,
+    rewritten: RewrittenQuestion | None = None,
+    sliced_text: str = "",
+) -> str:
+    """모드 B: 문항 이미지 + PDF 범위 + 사용자 오답을 바탕으로 PDF 용어만 사용한 AI 자동 해설을 생성한다."""
+    client = _build_client(api_key)
+
+    system_inst = (
+        "당신은 학생 맞춤형 1:1 AI 튜터입니다.\n"
+        "반드시 **업로드된 개념서 PDF에 있는 개념(pdf_concepts)과 허용 용어(pdf_vocabulary)만** 사용하여 설명하세요. "
+        "PDF 범위를 벗어나는 상위 교육과정 용어(예: 학생이 아직 안 배운 전공 용어)는 절대 사용하지 마세요.\n"
+        "학생이 고른 답과 정답을 비교해 왜 맞았는지 또는 어디서 헷갈렸는지 짚어주고, 단계별 풀이를 친절하고 명료하게 제시하세요."
+    )
+
+    rewritten_block = ""
+    if rewritten is not None:
+        choices_str = "\n".join(
+            f"{idx + 1}) {c}" for idx, c in enumerate(rewritten.rewritten_choices)
+        )
+        rewritten_block = (
+            f"\n[PDF 맞춤 개조 문항]\n{rewritten.rewritten_stem}\n{choices_str}\n"
+        )
+
+    prompt = (
+        f"[문항 정보] {question.exam_name} {question.q_num}번 ({question.curriculum_subject})\n"
+        f"[정답] {question.answer}\n"
+        f"[학생이 입력한 답] {user_answer or '(미입력)'}\n"
+        f"{rewritten_block}\n"
+        f"[공식 해설 참고] {question.official_explanation}\n\n"
+        f"[반드시 이 범위 내 개념·용어만 사용]\n"
+        f"- 허용 개념: {whitelist.pdf_concepts}\n"
+        f"- 허용 용어: {whitelist.pdf_vocabulary}\n"
+        f"- 개념서 본문 일부: {sliced_text[:4000]}\n\n"
+        "학생에게 보여줄 단계별 AI 자동 해설을 마크다운으로 작성해 주세요."
+    )
+
+    contents: list[Any] = []
+    if crop_png_bytes:
+        contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            temperature=0.2,
+        ),
+        fast_mode=True,
+    )
+    return (resp.text or "").strip()
+
+
+def chat_followup_with_pdf(
+    api_key: str,
+    model_name: str,
+    question: QuestionRecord,
+    crop_png_bytes: bytes | None,
+    whitelist: ConceptWhitelist,
+    chat_history: list[dict[str, str]],
+    user_question: str,
+    rewritten: RewrittenQuestion | None = None,
+    sliced_text: str = "",
+) -> str:
+    """모드 B: 문항별 추가 질문 채팅에 대해 PDF 개념/용어 범위 내에서만 답변한다."""
+    client = _build_client(api_key)
+
+    system_inst = (
+        "당신은 업로드된 개념서 PDF 범위 안에서만 답변하는 친절한 학습 튜터입니다. "
+        "반드시 아래 허용 개념(pdf_concepts)과 허용 용어(pdf_vocabulary)만 사용해 학생의 추가 질문에 답하세요. "
+        "PDF에 없는 상위 개념을 묻는 질문이라면 '현재 업로드하신 개념서 범위 밖의 용어이므로 개념서 내 표현으로 풀어서 설명드리면~'처럼 "
+        "PDF 범위 안의 표현으로 치환해 안내하세요."
+    )
+
+    rewritten_block = ""
+    if rewritten is not None:
+        choices_str = "\n".join(
+            f"{idx + 1}) {c}" for idx, c in enumerate(rewritten.rewritten_choices)
+        )
+        rewritten_block = f"\n[개조 문제]\n{rewritten.rewritten_stem}\n{choices_str}\n"
+
+    history_text = "\n".join(
+        f"{'학생' if m['role'] == 'user' else 'AI 튜터'}: {m['content']}"
+        for m in chat_history[-8:]
+    )
+
+    prompt = (
+        f"[문항] {question.exam_name} {question.q_num}번 | 정답: {question.answer}\n"
+        f"{rewritten_block}\n"
+        f"[허용 개념] {whitelist.pdf_concepts}\n"
+        f"[허용 용어] {whitelist.pdf_vocabulary}\n"
+        f"[개념서 참고] {sliced_text[:3000]}\n\n"
+        f"[이전 대화]\n{history_text}\n\n"
+        f"[학생의 새 질문]\n{user_question}"
+    )
+
+    contents: list[Any] = []
+    if crop_png_bytes:
+        contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            temperature=0.25,
+        ),
+        fast_mode=True,
+    )
+    return (resp.text or "").strip()
+
+
+def extract_exam_header_metadata(
+    api_key: str,
+    model_name: str,
+    first_page_text: str,
+    first_page_png_bytes: bytes | None = None,
+) -> ExamHeaderMetadata:
+    """
+    모의고사 PDF 1페이지 텍스트 또는 이미지를 분석해 시행 년도, 월, 학년, 과목, 표준 회차명을 추출한다.
+    """
+    client = _build_client(api_key)
+
+    system_inst = (
+        "당신은 한국 전국연합학력평가·수능·모의평가 시험지 헤더 메타데이터 파서입니다.\n"
+        "제공된 시험지 1페이지 텍스트 또는 이미지를 보고 다음 5개 필드를 정확히 추출하세요:\n"
+        "1) year: 4자리 시행 년도 문자열 (예: '2026')\n"
+        "2) month: 시행 월 문자열 ('3월', '6월', '9월', '11월' 등. 대학수학능력시험은 '11월'로 표기)\n"
+        "3) grade: 학년 문자열 ('고1', '고2', '고3' 중 하나. 고등학교 3학년/수능/모의평가는 '고3')\n"
+        "4) subject: 시험지 상단 헤더에 적힌 공식 과목명 (예: '국어', '수학', '영어', '한국사', '통합사회', '통합과학', '화학', '경제')\n"
+        "5) exam_title: 반드시 '{year}년 {month} {grade} {subject}' 형식으로 조합 (예: '2026년 9월 고1 통합사회')"
+    )
+
+    text_excerpt = (first_page_text or "").strip()[:4000]
+    prompt = (
+        "[시험지 1페이지 텍스트 발췌]\n"
+        f"{text_excerpt if text_excerpt else '(텍스트가 거의 없는 스캔 PDF입니다. 첨부된 1페이지 이미지를 확인하세요.)'}\n\n"
+        "위 1페이지에서 시행 년도, 시행 월, 학년, 과목명과 표준 회차명(exam_title)을 JSON으로 반환하세요."
+    )
+
+    contents: list[Any] = []
+    if first_page_png_bytes:
+        contents.append(types.Part.from_bytes(data=first_page_png_bytes, mime_type="image/png"))
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=ExamHeaderMetadata,
+            temperature=0.0,
+        ),
+    )
+    meta = _parse_structured(resp, ExamHeaderMetadata)
+
+    year = meta.year.strip()
+    month = meta.month.strip()
+    grade = meta.grade.strip()
+    subject = meta.subject.strip()
+    if year and month and grade and subject:
+        year_token = year if year.endswith("년") else f"{year}년"
+        month_token = month if month.endswith("월") else f"{month}월"
+        standardized_title = f"{year_token} {month_token} {grade} {subject}"
+    else:
+        standardized_title = meta.exam_title.strip()
+
+    return ExamHeaderMetadata(
+        year=year.rstrip("년"),
+        month=month if (not month or month.endswith("월")) else f"{month}월",
+        grade=grade,
+        subject=subject,
+        exam_title=standardized_title,
+    )
