@@ -401,6 +401,67 @@ def extract_concept_pages_by_ranges(
         return sliced_bytes, "\n\n".join(mapped_blocks), stats
 
 
+def extract_pdf_page_catalog(
+    pdf_bytes: bytes,
+    snippet_chars: int = 500,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    AI 자동 개념 페이지 판별을 위해 PDF 전체 각 페이지(1..N)의 요약 카탈로그를 생성한다.
+    텍스트가 충분한 PDF인지(has_text_layer) 여부도 함께 반환한다.
+    """
+    catalog: list[dict[str, Any]] = []
+    text_pages_count = 0
+
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total_pages = doc.page_count
+        for idx in range(total_pages):
+            raw_txt = (doc[idx].get_text("text") or "").strip()
+            compact_len = len(re.sub(r"\s+", "", raw_txt))
+            if compact_len >= 25:
+                text_pages_count += 1
+            lines = [ln.strip() for ln in raw_txt.splitlines() if ln.strip()]
+            head_snippet = "\n".join(lines)[:snippet_chars]
+            _, noise_hint = _clean_and_classify_concept_page(raw_txt)
+            catalog.append(
+                {
+                    "page": idx + 1,
+                    "char_count": compact_len,
+                    "noise_hint": noise_hint or "",
+                    "snippet": head_snippet,
+                }
+            )
+
+    has_text_layer = total_pages > 0 and (text_pages_count / total_pages) >= 0.25
+    return catalog, has_text_layer
+
+
+def extract_specific_pages_slice(
+    pdf_bytes: bytes,
+    page_numbers: list[int],
+) -> tuple[bytes, str]:
+    """
+    지정된 1-based 페이지 번호 리스트만 순서를 유지해 별도 PDF 바이트와 페이지 매핑 텍스트로 추출한다.
+    대용량 개념서 청크(Chunk) 처리에 사용한다.
+    """
+    with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total = doc.page_count
+        valid_pages = [p for p in page_numbers if 1 <= p <= total]
+        sliced_doc = pymupdf.open()
+        blocks: list[str] = []
+        for p_num in valid_pages:
+            sliced_doc.insert_pdf(doc, from_page=p_num - 1, to_page=p_num - 1)
+            raw_txt = (doc[p_num - 1].get_text("text") or "").strip()
+            cleaned_txt, _ = _clean_and_classify_concept_page(raw_txt)
+            use_txt = cleaned_txt or raw_txt
+            if use_txt:
+                blocks.append(f"=== [실제 페이지: p.{p_num}] ===\n{use_txt}")
+            else:
+                blocks.append(f"=== [실제 페이지: p.{p_num} (도표/이미지 중심 개념 페이지)] ===")
+        sliced_bytes = sliced_doc.tobytes(deflate=True)
+        sliced_doc.close()
+        return sliced_bytes, "\n\n".join(blocks)
+
+
 def _detect_columns(page: pymupdf.Page) -> list[tuple[float, float]]:
     """
     모의고사 PDF의 가로 중앙(page_width / 2)을 기준으로 왼쪽 단 -> 오른쪽 단 영역을 반환한다.

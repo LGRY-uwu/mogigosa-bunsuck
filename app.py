@@ -37,6 +37,7 @@ from src.gemini_service import (
     analyze_question_with_gemini,
     build_gemini_client,
     chat_followup_with_pdf,
+    detect_concept_pages_with_ai,
     detect_scanned_question_boxes,
     extract_concept_book_units,
     extract_concept_whitelist,
@@ -62,6 +63,7 @@ from src.pdf_parser import (
     extract_answer_snippets_from_pdf,
     extract_concept_pages_by_ranges,
     extract_exam_metadata_fast,
+    extract_pdf_page_catalog,
     extract_pdf_slice,
     get_page_text_lengths,
     get_pdf_page_count,
@@ -523,7 +525,7 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
         return
 
     with st.container(border=True):
-        st.markdown("#### ➕ 새 개념서·교과서 PDF 업로드 및 개념 구간 지정")
+        st.markdown("#### ➕ 새 개념서·교과서 PDF 업로드 및 개념 구간 추출")
         cb_col1, cb_col2 = st.columns(2)
         with cb_col1:
             book_title_in = st.text_input(
@@ -538,11 +540,31 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 key=f"{key_prefix}_subject_grade",
             )
 
-        page_ranges_in = st.text_input(
-            "추출할 개념 페이지 범위 입력 (쉼표 `,`와 하이픈 `-`으로 개념 설명 구간만 여러 개 지정 가능)",
-            placeholder="예: 12-25, 34-48, 60-75",
-            key=f"{key_prefix}_page_ranges",
+        extract_mode = st.radio(
+            "개념 페이지 추출 방식",
+            options=[
+                "🤖 자동 추출 (AI가 개념 부분 자동 판별 · 단원 정리)",
+                "✍️ 수동 추출 (추출할 개념 페이지 범위 직접 지정)",
+            ],
+            horizontal=True,
+            key=f"{key_prefix}_extract_mode",
         )
+        is_auto_mode = extract_mode.startswith("🤖")
+
+        page_ranges_in = ""
+        if not is_auto_mode:
+            page_ranges_in = st.text_input(
+                "추출할 개념 페이지 범위 입력 (쉼표 `,`와 하이픈 `-`으로 개념 설명 구간만 여러 개 지정 가능)",
+                placeholder="예: 12-25, 34-48, 60-75",
+                key=f"{key_prefix}_page_ranges",
+            )
+        else:
+            st.info(
+                "🤖 **AI 자동 추출 모드**: 페이지 범위를 직접 입력하지 않아도 "
+                "사이드바에서 선택된 Gemini AI 모델이 PDF 전체를 스캔해 **표지·목차·문제 풀이·정답지를 제외하고 "
+                "순수 개념 설명 구간만 자동 판별**한 뒤 단원별로 구조화합니다."
+            )
+
         cb_pdf_file = st.file_uploader(
             "교재 / 개념서 PDF 파일 업로드",
             type=["pdf"],
@@ -554,7 +576,7 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
         if cb_pdf_bytes is not None:
             total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
             st.caption(f"📄 업로드된 PDF: `{cb_pdf_file.name}` (전체 **{total_cb_pages}쪽**)")
-            if page_ranges_in.strip():
+            if not is_auto_mode and page_ranges_in.strip():
                 try:
                     parsed_intervals = parse_page_ranges_spec(page_ranges_in, total_cb_pages)
                     total_sel_pages = sum(e - s + 1 for s, e in parsed_intervals)
@@ -583,93 +605,212 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 except ValueError as ve:
                     st.error(str(ve))
 
-        build_db_btn = st.button(
-            "🧠 PyMuPDF 개념 구간 추출 & Gemini 단원별 공용 DB 저장",
-            type="primary",
-            use_container_width=True,
-            key=f"{key_prefix}_build_btn",
-        )
+        def _finalize_and_save_concept_book(
+            intervals_to_extract: list[tuple[int, int]],
+            spec_label: str,
+            status_box: Any,
+        ) -> None:
+            status_box.info(
+                "2단계: PyMuPDF로 선택 구간에서 목차·정답지·문제 풀이를 제외하고 순수 개념 텍스트와 실제 페이지 번호를 매핑 중..."
+            )
+            sliced_bytes, mapped_text, stats = extract_concept_pages_by_ranges(
+                cb_pdf_bytes, intervals_to_extract
+            )
+            skipped_info = stats.get("skipped_pages") or []
+            if skipped_info:
+                skip_summary = ", ".join(
+                    f"p.{sp['page']}({sp['reason']})" for sp in skipped_info[:10]
+                )
+                st.caption(f"🧹 불필요 페이지 자동 제외 ({len(skipped_info)}쪽): {skip_summary}")
 
-        if build_db_btn:
-            if not cb_pdf_bytes:
-                st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
-            elif not book_title_in.strip():
-                st.error("교재명을 입력해 주세요. (예: 완자 통합과학)")
-            elif not subject_grade_in.strip():
-                st.error("과목 및 학년을 입력해 주세요. (예: 고1 통합과학)")
-            elif not page_ranges_in.strip():
-                st.error("추출할 개념 페이지 범위를 입력해 주세요. (예: 12-25, 34-48, 60-75)")
-            elif not active_gemini_key:
-                st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+            model_disp = MODEL_LABELS.get(selected_model, selected_model)
+            status_box.info(
+                f"3단계: 사이드바 선택 모델({model_disp})로 단원별 핵심 개념·허용 용어·페이지 범위를 구조화하고 공용 DB에 동기화 중..."
+            )
+            extracted_book = extract_concept_book_units(
+                api_key=active_gemini_key,
+                model_name=selected_model,
+                book_title=book_title_in.strip(),
+                subject_and_grade=subject_grade_in.strip(),
+                page_ranges_display=stats["ranges_display"],
+                sliced_pdf_bytes=sliced_bytes,
+                mapped_concept_text=mapped_text,
+                original_pdf_bytes=cb_pdf_bytes,
+                kept_pages=stats.get("kept_pages"),
+                status_callback=lambda m: status_box.info(m),
+            )
+            grade_match = re.search(r"(고\s*[123])", subject_grade_in)
+            grade_str = (
+                grade_match.group(1).replace(" ", "")
+                if grade_match
+                else (extracted_book.grade or "고1")
+            )
+            book_id = f"{sanitize_id_part(book_title_in)}__{sanitize_id_part(subject_grade_in)}"
+            record = ConceptBookRecord(
+                id=book_id,
+                book_title=book_title_in.strip(),
+                subject=subject_grade_in.strip(),
+                grade=grade_str,
+                page_ranges_spec=spec_label,
+                units=extracted_book.units,
+                created_by=current_user.username,
+                created_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            save_err = storage.save_concept_book(record)
+            status_box.empty()
+            if save_err:
+                st.warning(save_err)
             else:
-                try:
-                    total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
-                    intervals = parse_page_ranges_spec(page_ranges_in, total_cb_pages)
-                except ValueError as ve:
-                    st.error(str(ve))
-                    intervals = []
+                st.success(
+                    f"🎉 공용 개념서 DB 저장 완료! (`{record.book_title}` · 총 {len(record.units)}개 단원 구조화 · "
+                    + (
+                        "로컬 ./concept_db 및 Google Drive 동기화 완료)"
+                        if storage.drive_connected
+                        else "로컬 ./concept_db 저장 완료)"
+                    )
+                )
 
-                if intervals:
-                    with st.spinner(
-                        "1/2단계: PyMuPDF로 지정 페이지에서 목차·정답지·문제 풀이를 제외하고 순수 개념 텍스트와 실제 페이지 번호를 매핑 중..."
-                    ):
-                        sliced_bytes, mapped_text, stats = extract_concept_pages_by_ranges(
-                            cb_pdf_bytes, intervals
-                        )
+        if is_auto_mode:
+            auto_b1, auto_b2 = st.columns([1.6, 1])
+            with auto_b1:
+                auto_build_btn = st.button(
+                    "🤖 AI 개념 구간 자동 판별 & 단원별 공용 DB 저장",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"{key_prefix}_auto_build_btn",
+                )
+            with auto_b2:
+                auto_preview_btn = st.button(
+                    "🔍 AI 개념 구간만 먼저 미리보기",
+                    use_container_width=True,
+                    key=f"{key_prefix}_auto_preview_btn",
+                )
 
-                    skipped_info = stats.get("skipped_pages") or []
-                    if skipped_info:
-                        skip_summary = ", ".join(
-                            f"p.{sp['page']}({sp['reason']})" for sp in skipped_info[:10]
-                        )
-                        st.caption(
-                            f"🧹 불필요 페이지 자동 제외 ({len(skipped_info)}쪽): {skip_summary}"
-                        )
+            preview_state_key = f"{key_prefix}_auto_detect_preview"
+            if cb_pdf_bytes is not None:
+                cur_auto_sig = hashlib.sha256(cb_pdf_bytes).hexdigest()[:12]
+                prev_auto = st.session_state.get(preview_state_key)
+                if prev_auto and prev_auto.get("pdf_sig") != cur_auto_sig:
+                    st.session_state.pop(preview_state_key, None)
 
-                    model_disp = MODEL_LABELS.get(selected_model, selected_model)
-                    with st.spinner(
-                        f"2/2단계: 사이드바 선택 모델({model_disp})로 단원별 핵심 개념·허용 용어·페이지 범위를 구조화하고 공용 DB에 동기화 중..."
-                    ):
-                        try:
-                            extracted_book = extract_concept_book_units(
+            if auto_preview_btn or auto_build_btn:
+                if not cb_pdf_bytes:
+                    st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
+                elif not active_gemini_key:
+                    st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                elif auto_build_btn and not book_title_in.strip():
+                    st.error("교재명을 입력해 주세요. (예: 완자 통합과학)")
+                elif auto_build_btn and not subject_grade_in.strip():
+                    st.error("과목 및 학년을 입력해 주세요. (예: 고1 통합과학)")
+                else:
+                    status_box = st.empty()
+                    try:
+                        cur_auto_sig = hashlib.sha256(cb_pdf_bytes).hexdigest()[:12]
+                        cached_prev = st.session_state.get(preview_state_key)
+                        if (
+                            auto_build_btn
+                            and cached_prev
+                            and cached_prev.get("pdf_sig") == cur_auto_sig
+                            and cached_prev.get("intervals")
+                        ):
+                            detected_out = cached_prev["detected_out"]
+                            detected_intervals = cached_prev["intervals"]
+                        else:
+                            status_box.info("1단계: PyMuPDF로 PDF 전체 페이지 구조 스캔 중...")
+                            catalog, has_text_layer = extract_pdf_page_catalog(cb_pdf_bytes)
+                            detected_out, detected_intervals = detect_concept_pages_with_ai(
                                 api_key=active_gemini_key,
                                 model_name=selected_model,
+                                pdf_bytes=cb_pdf_bytes,
+                                page_catalog=catalog,
+                                has_text_layer=has_text_layer,
                                 book_title=book_title_in.strip(),
                                 subject_and_grade=subject_grade_in.strip(),
-                                page_ranges_display=stats["ranges_display"],
-                                sliced_pdf_bytes=sliced_bytes,
-                                mapped_concept_text=mapped_text,
+                                status_callback=lambda m: status_box.info(m),
                             )
-                            grade_match = re.search(r"(고\s*[123])", subject_grade_in)
-                            grade_str = (
-                                grade_match.group(1).replace(" ", "")
-                                if grade_match
-                                else (extracted_book.grade or "고1")
+                            st.session_state[preview_state_key] = {
+                                "pdf_sig": cur_auto_sig,
+                                "detected_out": detected_out,
+                                "intervals": detected_intervals,
+                            }
+
+                        if not detected_intervals:
+                            status_box.empty()
+                            st.warning(
+                                "AI가 순수 개념 설명 구간을 찾지 못했습니다. [✍️ 수동 추출]로 전환해 페이지 범위를 직접 지정해 주세요."
                             )
-                            book_id = f"{sanitize_id_part(book_title_in)}__{sanitize_id_part(subject_grade_in)}"
-                            record = ConceptBookRecord(
-                                id=book_id,
-                                book_title=book_title_in.strip(),
-                                subject=subject_grade_in.strip(),
-                                grade=grade_str,
-                                page_ranges_spec=page_ranges_in.strip(),
-                                units=extracted_book.units,
-                                created_by=current_user.username,
-                                created_at=datetime.now().isoformat(timespec="seconds"),
+                        elif auto_preview_btn:
+                            status_box.empty()
+                            st.success(
+                                f"🔍 AI 개념 구간 판별 완료! (총 {len(detected_intervals)}개 구간 · "
+                                f"{sum(e - s + 1 for s, e in detected_intervals)}쪽 감지)"
                             )
-                            save_err = storage.save_concept_book(record)
-                            if save_err:
-                                st.warning(save_err)
-                            else:
-                                st.success(
-                                    f"🎉 공용 개념서 DB 저장 완료! (`{record.book_title}` · 총 {len(record.units)}개 단원 구조화 · "
-                                    + (
-                                        "로컬 ./concept_db 및 Google Drive 동기화 완료)"
-                                        if storage.drive_connected
-                                        else "로컬 ./concept_db 저장 완료)"
-                                    )
-                                )
+                        else:
+                            spec_auto = ", ".join(
+                                f"{s}-{e}" if s != e else f"{s}" for s, e in detected_intervals
+                            )
+                            _finalize_and_save_concept_book(
+                                intervals_to_extract=detected_intervals,
+                                spec_label=f"{spec_auto} (AI 자동 추출)",
+                                status_box=status_box,
+                            )
+                    except Exception as exc:
+                        status_box.empty()
+                        st.error(f"AI 자동 추출 실패: {exc}")
+
+            saved_preview = st.session_state.get(preview_state_key)
+            if saved_preview and saved_preview.get("intervals"):
+                det_out = saved_preview["detected_out"]
+                det_ints = saved_preview["intervals"]
+                det_spec = ", ".join(f"p.{s}~p.{e}" if s != e else f"p.{s}" for s, e in det_ints)
+                with st.expander(
+                    f"🤖 AI가 자동 판별한 개념 구간 ({det_spec} · {sum(e - s + 1 for s, e in det_ints)}쪽)",
+                    expanded=True,
+                ):
+                    for r_item in det_out.detected_ranges:
+                        st.write(
+                            f"- **{r_item.unit_hint}**: `p.{r_item.start_page}~p.{r_item.end_page}`"
+                            + (f" — {r_item.reason}" if r_item.reason else "")
+                        )
+                    if det_out.excluded_summary:
+                        st.caption(f"🧹 AI 제외 판단 구간: {det_out.excluded_summary}")
+        else:
+            build_db_btn = st.button(
+                "🧠 PyMuPDF 개념 구간 추출 & Gemini 단원별 공용 DB 저장",
+                type="primary",
+                use_container_width=True,
+                key=f"{key_prefix}_build_btn",
+            )
+
+            if build_db_btn:
+                if not cb_pdf_bytes:
+                    st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
+                elif not book_title_in.strip():
+                    st.error("교재명을 입력해 주세요. (예: 완자 통합과학)")
+                elif not subject_grade_in.strip():
+                    st.error("과목 및 학년을 입력해 주세요. (예: 고1 통합과학)")
+                elif not page_ranges_in.strip():
+                    st.error("추출할 개념 페이지 범위를 입력해 주세요. (예: 12-25, 34-48, 60-75)")
+                elif not active_gemini_key:
+                    st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                else:
+                    try:
+                        total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
+                        intervals = parse_page_ranges_spec(page_ranges_in, total_cb_pages)
+                    except ValueError as ve:
+                        st.error(str(ve))
+                        intervals = []
+
+                    if intervals:
+                        status_box = st.empty()
+                        try:
+                            _finalize_and_save_concept_book(
+                                intervals_to_extract=intervals,
+                                spec_label=f"{page_ranges_in.strip()} (수동 추출)",
+                                status_box=status_box,
+                            )
                         except Exception as exc:
+                            status_box.empty()
                             st.error(f"개념서 단원별 구조화 추출 실패: {exc}")
 
     # 등록된 공용 개념서 DB 목록 조회 및 관리

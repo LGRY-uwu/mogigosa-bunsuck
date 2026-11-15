@@ -113,6 +113,28 @@ class ConceptBookExtractionOutput(BaseModel):
     )
 
 
+class AutoConceptRangeItem(BaseModel):
+    """AI가 개념서·교과서 PDF 전체에서 자동 판별한 순수 개념 설명 페이지 구간."""
+
+    unit_hint: str = Field(..., description="해당 구간이 다루는 대단원/중단원 또는 주제명")
+    start_page: int = Field(..., ge=1, description="개념 설명 시작 PDF 페이지 번호 (1-based)")
+    end_page: int = Field(..., ge=1, description="개념 설명 끝 PDF 페이지 번호 (1-based)")
+    reason: str = Field(default="", description="개념 설명 구간으로 판별한 근거 요약")
+
+
+class AutoConceptPageDetectionOutput(BaseModel):
+    """AI가 개념서 PDF 전체를 훑어 목차·정답·문제풀이를 제외하고 개념 페이지만 추출한 결과."""
+
+    detected_ranges: list[AutoConceptRangeItem] = Field(
+        default_factory=list,
+        description="순수 개념/원리/이론 설명이 수록된 PDF 페이지 구간 목록",
+    )
+    excluded_summary: str = Field(
+        default="",
+        description="제외된 구간 요약 (예: p.1~3 표지/목차, p.26~33 실전문제, p.180~210 정답·해설)",
+    )
+
+
 class ConceptBookRecord(BaseModel):
     """./concept_db 및 Google Drive 공용 폴더에 저장되는 개념서·교과서 DB 레코드."""
 

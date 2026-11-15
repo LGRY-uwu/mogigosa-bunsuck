@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 
 from src.config import DEFAULT_MODEL, HYDROGEN_MODEL, resolve_api_model_name
 from src.models import (
+    AutoConceptPageDetectionOutput,
+    AutoConceptRangeItem,
     BatchMatchResult,
     ConceptBookExtractionOutput,
     ConceptUnit,
@@ -22,6 +24,7 @@ from src.models import (
     QuestionRecord,
     RewrittenQuestion,
 )
+from src.pdf_parser import extract_specific_pages_slice
 
 T = TypeVar("T")
 
@@ -472,6 +475,184 @@ def analyze_question_with_gemini(
     return _parse_structured(resp, QuestionExtractionOutput)
 
 
+def detect_concept_pages_with_ai(
+    api_key: str,
+    model_name: str,
+    pdf_bytes: bytes,
+    page_catalog: list[dict[str, Any]],
+    has_text_layer: bool,
+    book_title: str = "",
+    subject_and_grade: str = "",
+    status_callback: Callable[[str], None] | None = None,
+) -> tuple[AutoConceptPageDetectionOutput, list[tuple[int, int]]]:
+    """
+    AI(사이드바 선택 모델)가 개념서·교과서 PDF 전체 구조를 분석해
+    표지·목차·연습문제·실전문제·정답 및 해설을 제외하고
+    '순수 개념 설명 구간'의 페이지 범위(start_page~end_page)를 자동 판별한다.
+    """
+    total_pages = len(page_catalog)
+    if total_pages == 0:
+        raise ValueError("PDF에 페이지가 없습니다.")
+
+    client = _build_client(api_key, timeout_seconds=60)
+    system_inst = (
+        "당신은 대한민국 교과서 및 개념서(완자, 개념원리, 수능특강 등) PDF 구조 판별 AI입니다.\n"
+        "주어진 PDF 페이지 목록 또는 페이지를 보고 **순수 개념·이론·원리·공식 설명이 수록된 페이지 구간만** 정확히 판별하세요.\n"
+        "반드시 제외해야 하는 페이지:\n"
+        "- 표지, 머리말, 책의 구성과 특징, 목차(차례)\n"
+        "- 개념 확인 문제 외의 실전 문제, 내신 만점 문제, 수능 기출 문제, 연습 문제, 단원 마무리 문제 전용 페이지\n"
+        "- 정답과 해설, 빠른 정답 찾기, 채점 기준표 페이지\n"
+        "반드시 포함해야 하는 페이지:\n"
+        "- 대단원/중단원 도입, 핵심 개념 정리, 개념 설명 본문, 탐구 활동·자료 분석·실험 원리 설명, 필수 공식 및 용어 정리 페이지\n"
+        "출력 규칙:\n"
+        "- detected_ranges에는 연속된 개념 페이지 구간마다 unit_hint(단원/주제명), start_page, end_page(1-based PDF 쪽번호), reason을 적으세요.\n"
+        "- excluded_summary에는 제외한 표지/목차/문제/정답 구간을 간단히 요약하세요."
+    )
+
+    all_items: list[AutoConceptRangeItem] = []
+    excluded_notes: list[str] = []
+
+    if has_text_layer:
+        batch_size = 65
+        for start_idx in range(0, total_pages, batch_size):
+            batch = page_catalog[start_idx : start_idx + batch_size]
+            if status_callback is not None:
+                status_callback(
+                    f"🤖 AI 개념 구간 자동 판별 중 ({batch[0]['page']}~{batch[-1]['page']}쪽 / 전체 {total_pages}쪽)..."
+                )
+            lines = []
+            for entry in batch:
+                hint_tag = f" [로컬감지:{entry['noise_hint']}]" if entry["noise_hint"] else ""
+                snip = entry["snippet"].replace("\n", " | ")[:380]
+                lines.append(f"[p.{entry['page']}{hint_tag}] {snip if snip else '(텍스트 없음/이미지 페이지)'}")
+
+            prompt = (
+                f"- 교재명: {book_title or '(미입력)'} | 과목/학년: {subject_and_grade or '(미입력)'}\n"
+                f"- 분석 대상 구간: PDF {batch[0]['page']}쪽 ~ {batch[-1]['page']}쪽 (전체 {total_pages}쪽)\n\n"
+                "아래 페이지별 발췌 내용을 보고 순수 개념 설명 구간(`detected_ranges`)만 판별해 JSON으로 반환하세요.\n\n"
+                + "\n".join(lines)
+            )
+            resp = _generate_content_with_fallback(
+                client=client,
+                model_name=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_inst,
+                    response_mime_type="application/json",
+                    response_schema=AutoConceptPageDetectionOutput,
+                    temperature=0.0,
+                ),
+                status_callback=status_callback,
+            )
+            parsed = _parse_structured(resp, AutoConceptPageDetectionOutput)
+            all_items.extend(parsed.detected_ranges)
+            if parsed.excluded_summary.strip():
+                excluded_notes.append(parsed.excluded_summary.strip())
+    else:
+        # 스캔(이미지) PDF인 경우 15쪽씩 슬라이스 PDF를 Gemini Vision으로 스캔
+        batch_size = 15
+        for start_idx in range(0, total_pages, batch_size):
+            batch_pages = [
+                entry["page"] for entry in page_catalog[start_idx : start_idx + batch_size]
+            ]
+            if status_callback is not None:
+                status_callback(
+                    f"🖼️ 스캔 PDF AI 시각 판별 중 ({batch_pages[0]}~{batch_pages[-1]}쪽 / 전체 {total_pages}쪽)..."
+                )
+            slice_b, _ = extract_specific_pages_slice(pdf_bytes, batch_pages)
+            pdf_part = prepare_pdf_part(client, slice_b, display_name=f"scan_batch_{batch_pages[0]}.pdf")
+            prompt = (
+                f"- 교재명: {book_title or '(미입력)'} | 과목/학년: {subject_and_grade or '(미입력)'}\n"
+                f"- 첨부된 PDF는 원본의 **실제 {batch_pages[0]}쪽 ~ {batch_pages[-1]}쪽**입니다 "
+                f"(첨부 PDF 1쪽 = 원본 {batch_pages[0]}쪽).\n"
+                "각 페이지를 시각적으로 확인하여 목차·문제풀이·정답지를 제외하고 "
+                "순수 개념 설명이 들어있는 원본 페이지 번호 범위(`start_page`, `end_page`)를 반환하세요."
+            )
+            resp = _generate_content_with_fallback(
+                client=client,
+                model_name=model_name,
+                contents=[pdf_part, prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=system_inst,
+                    response_mime_type="application/json",
+                    response_schema=AutoConceptPageDetectionOutput,
+                    temperature=0.0,
+                ),
+                status_callback=status_callback,
+            )
+            parsed = _parse_structured(resp, AutoConceptPageDetectionOutput)
+            all_items.extend(parsed.detected_ranges)
+            if parsed.excluded_summary.strip():
+                excluded_notes.append(parsed.excluded_summary.strip())
+
+    # 유효한 구간 정규화 및 인접/겹침 구간 병합
+    valid_items: list[AutoConceptRangeItem] = []
+    raw_intervals: list[tuple[int, int]] = []
+    for it in all_items:
+        s_p = max(1, min(total_pages, int(it.start_page)))
+        e_p = max(1, min(total_pages, int(it.end_page)))
+        if s_p > e_p:
+            s_p, e_p = e_p, s_p
+        valid_items.append(
+            AutoConceptRangeItem(
+                unit_hint=it.unit_hint.strip() or f"개념 구간 p.{s_p}~p.{e_p}",
+                start_page=s_p,
+                end_page=e_p,
+                reason=it.reason.strip(),
+            )
+        )
+        raw_intervals.append((s_p, e_p))
+
+    raw_intervals.sort(key=lambda x: (x[0], x[1]))
+    merged_intervals: list[tuple[int, int]] = []
+    for s_p, e_p in raw_intervals:
+        if not merged_intervals or s_p > merged_intervals[-1][1] + 1:
+            merged_intervals.append((s_p, e_p))
+        else:
+            merged_intervals[-1] = (merged_intervals[-1][0], max(merged_intervals[-1][1], e_p))
+
+    valid_items.sort(key=lambda x: (x.start_page, x.end_page))
+    merged_result = AutoConceptPageDetectionOutput(
+        detected_ranges=valid_items,
+        excluded_summary=" / ".join(dict.fromkeys(excluded_notes)),
+    )
+    return merged_result, merged_intervals
+
+
+def _merge_concept_units(units: list[ConceptUnit]) -> list[ConceptUnit]:
+    """청크 분할 추출 시 동일 단원명이 나뉜 경우 핵심 개념·허용 용어·페이지 범위를 병합한다."""
+    merged: list[ConceptUnit] = []
+    by_name: dict[str, ConceptUnit] = {}
+    for u in units:
+        key = u.unit_name.strip()
+        if not key:
+            continue
+        if key not in by_name:
+            clone = ConceptUnit(
+                unit_name=key,
+                page_range=u.page_range.strip(),
+                core_concepts=list(dict.fromkeys(c.strip() for c in u.core_concepts if c.strip())),
+                allowed_terms_and_units=list(
+                    dict.fromkeys(t.strip() for t in u.allowed_terms_and_units if t.strip())
+                ),
+            )
+            by_name[key] = clone
+            merged.append(clone)
+        else:
+            existing = by_name[key]
+            if u.page_range.strip() and u.page_range.strip() not in existing.page_range:
+                existing.page_range = f"{existing.page_range}, {u.page_range.strip()}".strip(", ")
+            for c in u.core_concepts:
+                cs = c.strip()
+                if cs and cs not in existing.core_concepts:
+                    existing.core_concepts.append(cs)
+            for t in u.allowed_terms_and_units:
+                ts = t.strip()
+                if ts and ts not in existing.allowed_terms_and_units:
+                    existing.allowed_terms_and_units.append(ts)
+    return merged
+
+
 def extract_concept_book_units(
     api_key: str,
     model_name: str,
@@ -480,13 +661,16 @@ def extract_concept_book_units(
     page_ranges_display: str,
     sliced_pdf_bytes: bytes,
     mapped_concept_text: str,
+    original_pdf_bytes: bytes | None = None,
+    kept_pages: list[int] | None = None,
+    status_callback: Callable[[str], None] | None = None,
 ) -> ConceptBookExtractionOutput:
     """
     지정된 페이지 범위에서 추출된 개념 텍스트(및 슬라이스 PDF)를
     사이드바 선택 Gemini 모델(model_name)로 분석하여 단원별(대단원/중단원) 개념 + 페이지 번호 구조화 DB를 생성한다.
+    추출 페이지가 많은 경우(25쪽 초과) 자동으로 청크 분할 분석 후 단원별로 병합한다.
     """
     client = _build_client(api_key, timeout_seconds=60)
-    pdf_part = prepare_pdf_part(client, sliced_pdf_bytes, display_name="concept_book_slice.pdf")
 
     system_inst = (
         "당신은 2022 개정 교육과정 개념서·교과서 구조화 전문가입니다.\n"
@@ -501,28 +685,56 @@ def extract_concept_book_units(
         "6. 제공된 페이지 범위에 없는 상위 과목 개념이나 다른 단원 용어를 절대 임의로 추가하지 마세요."
     )
 
-    excerpt = mapped_concept_text[:28000] if mapped_concept_text else "(이미지 중심 개념서 PDF)"
-    prompt = (
-        f"- 교재명(book_title): {book_title}\n"
-        f"- 과목 및 학년(subject / grade): {subject_and_grade}\n"
-        f"- 추출 대상 개념 페이지 범위: {page_ranges_display}\n\n"
-        "첨부된 개념서 슬라이스 PDF와 아래 페이지별 추출 텍스트를 정독한 뒤, "
-        "단원별로 구분하여 JSON 스키마(book_title, subject, grade, units)에 맞게 반환하세요.\n\n"
-        f"[페이지별 개념 텍스트]\n{excerpt}"
-    )
+    def _run_chunk(chunk_pdf: bytes, chunk_text: str, chunk_label: str) -> ConceptBookExtractionOutput:
+        pdf_part = prepare_pdf_part(client, chunk_pdf, display_name="concept_book_slice.pdf")
+        excerpt = chunk_text[:60000] if chunk_text else "(이미지 중심 개념서 PDF)"
+        prompt = (
+            f"- 교재명(book_title): {book_title}\n"
+            f"- 과목 및 학년(subject / grade): {subject_and_grade}\n"
+            f"- 추출 대상 개념 페이지 범위: {chunk_label}\n\n"
+            "첨부된 개념서 슬라이스 PDF와 아래 페이지별 추출 텍스트를 정독한 뒤, "
+            "단원별로 구분하여 JSON 스키마(book_title, subject, grade, units)에 맞게 반환하세요.\n\n"
+            f"[페이지별 개념 텍스트]\n{excerpt}"
+        )
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=[pdf_part, prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=system_inst,
+                response_mime_type="application/json",
+                response_schema=ConceptBookExtractionOutput,
+                temperature=0.0,
+            ),
+            status_callback=status_callback,
+        )
+        return _parse_structured(resp, ConceptBookExtractionOutput)
 
-    resp = _generate_content_with_fallback(
-        client=client,
-        model_name=model_name,
-        contents=[pdf_part, prompt],
-        config=types.GenerateContentConfig(
-            system_instruction=system_inst,
-            response_mime_type="application/json",
-            response_schema=ConceptBookExtractionOutput,
-            temperature=0.0,
-        ),
-    )
-    parsed = _parse_structured(resp, ConceptBookExtractionOutput)
+    if original_pdf_bytes is not None and kept_pages and len(kept_pages) > 25:
+        chunk_size = 25
+        collected_units: list[ConceptUnit] = []
+        detected_grade = ""
+        total_chunks = (len(kept_pages) + chunk_size - 1) // chunk_size
+        for c_idx, offset in enumerate(range(0, len(kept_pages), chunk_size), start=1):
+            sub_pages = kept_pages[offset : offset + chunk_size]
+            sub_label = f"p.{sub_pages[0]}~p.{sub_pages[-1]} ({c_idx}/{total_chunks} 구간)"
+            if status_callback is not None:
+                status_callback(f"📚 단원별 개념 구조화 분석 중 ({sub_label})...")
+            sub_pdf, sub_txt = extract_specific_pages_slice(original_pdf_bytes, sub_pages)
+            sub_out = _run_chunk(sub_pdf, sub_txt, sub_label)
+            collected_units.extend(sub_out.units)
+            if not detected_grade and sub_out.grade:
+                detected_grade = sub_out.grade
+
+        merged_units = _merge_concept_units(collected_units)
+        return ConceptBookExtractionOutput(
+            book_title=book_title.strip(),
+            subject=subject_and_grade.strip(),
+            grade=detected_grade or "고1",
+            units=merged_units,
+        )
+
+    parsed = _run_chunk(sliced_pdf_bytes, mapped_concept_text, page_ranges_display)
     if book_title.strip():
         parsed.book_title = book_title.strip()
     if subject_and_grade.strip():
