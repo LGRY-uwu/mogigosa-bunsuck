@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
+import json
+import os
 import re
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
-from src.config import resolve_admin_config
+from src.config import _safe_get_secret, resolve_admin_config
 from src.models import TierType, UserRecord
 from src.storage import StorageManager
 
@@ -55,6 +59,98 @@ def mask_api_key(api_key: str) -> str:
     if len(key) <= 6:
         return key[:2] + "••••••••"
     return f"{key[:6]}••••••••"
+
+
+SESSION_TOKEN_TTL_SECONDS: int = 7 * 24 * 3600
+
+
+def _get_session_signing_key(storage: StorageManager | None = None) -> bytes:
+    """새로고침 이후에도 유지되는 서명용 비밀키를 결정론적으로 로드한다."""
+    parts: list[str] = []
+    for key_name in ("SESSION_SECRET", "ADMIN_PASSWORD", "GEMINI_API_KEY", "GOOGLE_DRIVE_FOLDER_ID"):
+        sec_val = _safe_get_secret([key_name, key_name.lower()])
+        if isinstance(sec_val, str) and sec_val.strip():
+            parts.append(f"{key_name}:{sec_val.strip()}")
+        elif os.environ.get(key_name, "").strip():
+            parts.append(f"{key_name}:{os.environ[key_name].strip()}")
+
+    if parts:
+        seed = "|".join(parts)
+        return hashlib.sha256(f"mogigosa-session-v1:{seed}".encode("utf-8")).digest()
+
+    if storage is not None:
+        secret_file = storage.local_root / ".session_secret"
+        try:
+            if secret_file.exists():
+                existing = secret_file.read_text(encoding="utf-8").strip()
+                if existing:
+                    return hashlib.sha256(existing.encode("utf-8")).digest()
+            generated = secrets.token_hex(32)
+            secret_file.write_text(generated, encoding="utf-8")
+            return hashlib.sha256(generated.encode("utf-8")).digest()
+        except Exception:
+            pass
+
+    return hashlib.sha256(b"mogigosa-local-fallback-secret").digest()
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+def create_session_token(
+    username: str,
+    storage: StorageManager | None = None,
+    ttl_seconds: int = SESSION_TOKEN_TTL_SECONDS,
+) -> str:
+    """브라우저 새로고침 시 로그인 상태를 안전하게 복원하기 위한 HMAC 서명 세션 토큰을 생성한다."""
+    norm = normalize_username(username)
+    payload = {"u": norm, "exp": int(time.time()) + max(60, int(ttl_seconds))}
+    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    sig = hmac.new(
+        _get_session_signing_key(storage),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{payload_b64}.{_b64url_encode(sig)}"
+
+
+def verify_session_token(token: str, storage: StorageManager | None = None) -> str | None:
+    """HMAC 서명 세션 토큰을 검증하고 유효한 경우 정규화된 username을 반환한다."""
+    raw = (token or "").strip()
+    if "." not in raw:
+        return None
+    payload_b64, sig_b64 = raw.split(".", 1)
+    if not payload_b64 or not sig_b64:
+        return None
+
+    expected_sig = hmac.new(
+        _get_session_signing_key(storage),
+        payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    try:
+        actual_sig = _b64url_decode(sig_b64)
+        if not hmac.compare_digest(actual_sig, expected_sig):
+            return None
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    username = normalize_username(str(payload.get("u", "")))
+    exp = payload.get("exp")
+    if not username or not isinstance(exp, (int, float)):
+        return None
+    if time.time() > float(exp):
+        return None
+    return username
 
 
 def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) -> bool:

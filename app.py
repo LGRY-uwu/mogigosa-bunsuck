@@ -21,12 +21,14 @@ from src.auth import (
     can_use_premium_features,
     clear_user_custom_api_key,
     consume_extraction_quota,
+    create_session_token,
     get_remaining_free_quota,
     get_user_by_username,
     mask_api_key,
     register_user,
     resolve_active_gemini_api_key,
     save_user_custom_api_key,
+    verify_session_token,
 )
 from src.config import AVAILABLE_MODELS, DEFAULT_MODEL, MODEL_LABELS, resolve_credentials
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
@@ -171,6 +173,17 @@ if storage.drive_connected and st.session_state["drive_sync_key"] != sync_finger
     if not sync_out.get("error"):
         st.session_state["drive_sync_key"] = sync_fingerprint
 
+if not st.session_state["logged_in_username"]:
+    raw_session_tok = st.query_params.get("session")
+    if isinstance(raw_session_tok, list):
+        raw_session_tok = raw_session_tok[-1] if raw_session_tok else ""
+    if raw_session_tok:
+        restored_username = verify_session_token(str(raw_session_tok), storage=storage)
+        if restored_username:
+            st.session_state["logged_in_username"] = restored_username
+        else:
+            st.query_params.pop("session", None)
+
 current_user = (
     get_user_by_username(storage, st.session_state["logged_in_username"])
     if st.session_state["logged_in_username"]
@@ -178,6 +191,9 @@ current_user = (
 )
 if st.session_state["logged_in_username"] and current_user is None:
     st.session_state["logged_in_username"] = ""
+    st.query_params.pop("session", None)
+elif current_user is not None and not st.query_params.get("session"):
+    st.query_params["session"] = create_session_token(current_user.username, storage=storage)
 
 is_admin = bool(current_user is not None and current_user.tier == "ADMIN")
 selected_model = DEFAULT_MODEL
@@ -200,6 +216,9 @@ with st.sidebar:
                 ok, msg, logged_user = authenticate_user(storage, login_id, login_pw)
                 if ok and logged_user is not None:
                     st.session_state["logged_in_username"] = logged_user.username
+                    st.query_params["session"] = create_session_token(
+                        logged_user.username, storage=storage
+                    )
                     st.success(msg)
                     st.rerun()
                 else:
@@ -219,6 +238,9 @@ with st.sidebar:
                     ok, msg, new_user = register_user(storage, reg_id, reg_nick, reg_pw)
                     if ok and new_user is not None:
                         st.session_state["logged_in_username"] = new_user.username
+                        st.query_params["session"] = create_session_token(
+                            new_user.username, storage=storage
+                        )
                         st.success(msg)
                         st.rerun()
                     else:
@@ -314,6 +336,7 @@ with st.sidebar:
             st.session_state["logged_in_username"] = ""
             st.session_state["matched_items"] = []
             st.session_state["generated_exam_pdf"] = None
+            st.query_params.pop("session", None)
             st.rerun()
 
         st.markdown("---")
