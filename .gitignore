@@ -1,0 +1,23 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Streamlit secrets & local env
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Local database & sensitive key JSON files
+exam_db/
+*.json
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

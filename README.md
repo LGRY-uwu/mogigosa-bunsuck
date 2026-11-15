@@ -1,2 +1,0 @@
-# mogigosa-bunsuck
-mogimogi
