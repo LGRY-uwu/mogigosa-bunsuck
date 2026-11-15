@@ -238,6 +238,13 @@ def can_use_premium_features(user: UserRecord) -> bool:
     return user.tier in ("CUSTOM", "PRO", "ADMIN")
 
 
+def can_access_shared_concept_db(user: UserRecord | None) -> bool:
+    """공용 개념서·교과서 DB 구축(업로드) 및 단원별 불러오기 권한 여부 (PRO[VIP] / ADMIN 전용)."""
+    if user is None:
+        return False
+    return user.tier in ("PRO", "ADMIN")
+
+
 def consume_extraction_quota(
     storage: StorageManager,
     username: str,

@@ -17,6 +17,7 @@ from src.auth import (
     VALID_TIERS,
     authenticate_user,
     batch_update_user_tiers,
+    can_access_shared_concept_db,
     can_use_premium_features,
     clear_user_custom_api_key,
     consume_extraction_quota,
@@ -35,6 +36,7 @@ from src.gemini_service import (
     build_gemini_client,
     chat_followup_with_pdf,
     detect_scanned_question_boxes,
+    extract_concept_book_units,
     extract_concept_whitelist,
     generate_pdf_grounded_explanation,
     match_questions_to_whitelist,
@@ -42,21 +44,27 @@ from src.gemini_service import (
     rewrite_question_for_pdf,
 )
 from src.models import (
+    ConceptBookRecord,
+    ConceptUnit,
     ConceptWhitelist,
     QuestionRecord,
     RewrittenQuestion,
+    build_whitelist_from_concept_units,
     infer_subject_category,
+    resolve_question_concept_reference,
 )
 from src.pdf_generator import generate_custom_exam_pdf
 from src.pdf_parser import (
     CroppedQuestion,
     crop_normalized_box,
     extract_answer_snippets_from_pdf,
+    extract_concept_pages_by_ranges,
     extract_exam_metadata_fast,
     extract_pdf_slice,
     get_page_text_lengths,
     get_pdf_page_count,
     parse_exam_pdf,
+    parse_page_ranges_spec,
     render_pdf_page_png,
 )
 from src.storage import StorageManager
@@ -319,11 +327,13 @@ with st.sidebar:
 
         # 저장소 & DB 요약
         all_records = storage.load_db()
-        st.markdown("### 📊 기출 DB & 저장소")
-        c1, c2 = st.columns(2)
-        c1.metric("저장 문항", f"{len(all_records)}개")
+        all_concept_books = storage.load_concept_books()
+        st.markdown("### 📊 기출 · 개념서 DB & 저장소")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("기출 문항", f"{len(all_records)}개")
         unique_exams = sorted({r.exam_name for r in all_records})
         c2.metric("등록 회차", f"{len(unique_exams)}회")
+        c3.metric("공용 개념서", f"{len(all_concept_books)}권")
         if storage.drive_connected:
             mode_tag = "OAuth" if storage.drive_auth_mode == "oauth" else "서비스 계정"
             st.caption(f"☁️ Google Drive 연동됨 ({storage.drive_folder_name} · {mode_tag})")
@@ -331,7 +341,7 @@ with st.sidebar:
             if sync_res.get("error"):
                 st.warning(f"Drive 동기화 오류: {sync_res['error'][:160]}")
         else:
-            st.caption("💾 로컬 영구 저장소 (`./exam_db`)")
+            st.caption("💾 로컬 영구 저장소 (`./exam_db`, `./concept_db`)")
             if storage.drive_error:
                 st.caption(f"⚠️ Drive 연결 오류: {storage.drive_error[:140]}")
 
@@ -459,31 +469,256 @@ if current_user is None:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-PRO'>VIP 회원 (PRO)</span>", unsafe_allow_html=True)
             st.markdown("#### 관리자 승급 등급")
-            st.write("- 서버 API 키 사용")
-            st.write("- 추출 문항 수 **무제한**")
+            st.write("- 서버 API 키 사용 · 추출 **무제한**")
+            st.write("- **공용 개념서·교과서 DB** 구축 & 불러오기")
             st.write("- 문제 개조 & PDF 병합 무제한")
     with t_col4:
         with st.container(border=True):
             st.markdown("<span class='tier-badge tier-ADMIN'>최고 관리자 (ADMIN)</span>", unsafe_allow_html=True)
             st.markdown("#### 관리자 계정")
             st.write("- 서버 API 키 **무제한**")
-            st.write("- 전체 기능 무제한 이용")
+            st.write("- **공용 개념서·교과서 DB** 구축 & 관리")
             st.write("- **회원 등급 관리** 패널 접근")
     st.stop()
 
+
+def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
+    """관리자(ADMIN) 및 Pro(VIP) 등급용 개념서·교과서 PDF 단원별 공용 DB 구축 & 관리 UI."""
+    st.subheader("📚 개념서·교과서 PDF 단원별 공용 DB 구축 (관리자 · Pro 전용)")
+    st.caption(
+        "지정한 개념 페이지 구간만 PyMuPDF로 추출해 목차·정답지·문제 풀이를 제외하고, "
+        "사이드바에서 선택한 Gemini 모델로 단원별 핵심 개념과 허용 용어·단위를 구조화하여 "
+        "로컬(`./concept_db`) 및 Google Drive 공용 폴더에 자동 동기화합니다."
+    )
+
+    if not can_access_shared_concept_db(current_user):
+        st.warning(
+            "🔒 **공용 개념서·교과서 DB 구축 및 공유 기능은 Pro(VIP) · ADMIN 등급 전용입니다.**\n\n"
+            f"현재 로그인 등급: **{TIER_LABELS.get(current_user.tier, current_user.tier)} ({current_user.tier})** — "
+            "관리자에게 Pro(VIP) 승급을 요청하시거나, [🎯 탭 2]의 **개별 개념서 PDF 직접 업로드** 기능을 이용해 주세요."
+        )
+        return
+
+    with st.container(border=True):
+        st.markdown("#### ➕ 새 개념서·교과서 PDF 업로드 및 개념 구간 지정")
+        cb_col1, cb_col2 = st.columns(2)
+        with cb_col1:
+            book_title_in = st.text_input(
+                "교재명",
+                placeholder="예: 완자 통합과학, 개념원리 공통수학1",
+                key=f"{key_prefix}_book_title",
+            )
+        with cb_col2:
+            subject_grade_in = st.text_input(
+                "과목 및 학년",
+                placeholder="예: 고1 통합과학",
+                key=f"{key_prefix}_subject_grade",
+            )
+
+        page_ranges_in = st.text_input(
+            "추출할 개념 페이지 범위 입력 (쉼표 `,`와 하이픈 `-`으로 개념 설명 구간만 여러 개 지정 가능)",
+            placeholder="예: 12-25, 34-48, 60-75",
+            key=f"{key_prefix}_page_ranges",
+        )
+        cb_pdf_file = st.file_uploader(
+            "교재 / 개념서 PDF 파일 업로드",
+            type=["pdf"],
+            key=f"{key_prefix}_pdf_uploader",
+        )
+
+        cb_pdf_bytes: bytes | None = cb_pdf_file.getvalue() if cb_pdf_file is not None else None
+        parsed_intervals: list[tuple[int, int]] = []
+        if cb_pdf_bytes is not None:
+            total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
+            st.caption(f"📄 업로드된 PDF: `{cb_pdf_file.name}` (전체 **{total_cb_pages}쪽**)")
+            if page_ranges_in.strip():
+                try:
+                    parsed_intervals = parse_page_ranges_spec(page_ranges_in, total_cb_pages)
+                    total_sel_pages = sum(e - s + 1 for s, e in parsed_intervals)
+                    interval_str = ", ".join(
+                        f"p.{s}~p.{e}" if s != e else f"p.{s}" for s, e in parsed_intervals
+                    )
+                    st.info(
+                        f"✅ 파싱된 개념 구간: **{interval_str}** (총 {len(parsed_intervals)}개 구간 · {total_sel_pages}쪽)"
+                    )
+                    with st.expander("👀 첫 구간 시작/끝 페이지 미리보기", expanded=False):
+                        first_s, first_e = parsed_intervals[0][0], parsed_intervals[-1][1]
+                        pv1, pv2 = st.columns(2)
+                        with pv1:
+                            st.image(
+                                render_pdf_page_png(cb_pdf_bytes, first_s, dpi=130),
+                                caption=f"첫 시작 페이지 (p.{first_s})",
+                                use_container_width=True,
+                            )
+                        with pv2:
+                            if first_e != first_s:
+                                st.image(
+                                    render_pdf_page_png(cb_pdf_bytes, first_e, dpi=130),
+                                    caption=f"마지막 끝 페이지 (p.{first_e})",
+                                    use_container_width=True,
+                                )
+                except ValueError as ve:
+                    st.error(str(ve))
+
+        build_db_btn = st.button(
+            "🧠 PyMuPDF 개념 구간 추출 & Gemini 단원별 공용 DB 저장",
+            type="primary",
+            use_container_width=True,
+            key=f"{key_prefix}_build_btn",
+        )
+
+        if build_db_btn:
+            if not cb_pdf_bytes:
+                st.error("교재/개념서 PDF 파일을 먼저 업로드해 주세요.")
+            elif not book_title_in.strip():
+                st.error("교재명을 입력해 주세요. (예: 완자 통합과학)")
+            elif not subject_grade_in.strip():
+                st.error("과목 및 학년을 입력해 주세요. (예: 고1 통합과학)")
+            elif not page_ranges_in.strip():
+                st.error("추출할 개념 페이지 범위를 입력해 주세요. (예: 12-25, 34-48, 60-75)")
+            elif not active_gemini_key:
+                st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+            else:
+                try:
+                    total_cb_pages = get_pdf_page_count(cb_pdf_bytes)
+                    intervals = parse_page_ranges_spec(page_ranges_in, total_cb_pages)
+                except ValueError as ve:
+                    st.error(str(ve))
+                    intervals = []
+
+                if intervals:
+                    with st.spinner(
+                        "1/2단계: PyMuPDF로 지정 페이지에서 목차·정답지·문제 풀이를 제외하고 순수 개념 텍스트와 실제 페이지 번호를 매핑 중..."
+                    ):
+                        sliced_bytes, mapped_text, stats = extract_concept_pages_by_ranges(
+                            cb_pdf_bytes, intervals
+                        )
+
+                    skipped_info = stats.get("skipped_pages") or []
+                    if skipped_info:
+                        skip_summary = ", ".join(
+                            f"p.{sp['page']}({sp['reason']})" for sp in skipped_info[:10]
+                        )
+                        st.caption(
+                            f"🧹 불필요 페이지 자동 제외 ({len(skipped_info)}쪽): {skip_summary}"
+                        )
+
+                    model_disp = MODEL_LABELS.get(selected_model, selected_model)
+                    with st.spinner(
+                        f"2/2단계: 사이드바 선택 모델({model_disp})로 단원별 핵심 개념·허용 용어·페이지 범위를 구조화하고 공용 DB에 동기화 중..."
+                    ):
+                        try:
+                            extracted_book = extract_concept_book_units(
+                                api_key=active_gemini_key,
+                                model_name=selected_model,
+                                book_title=book_title_in.strip(),
+                                subject_and_grade=subject_grade_in.strip(),
+                                page_ranges_display=stats["ranges_display"],
+                                sliced_pdf_bytes=sliced_bytes,
+                                mapped_concept_text=mapped_text,
+                            )
+                            grade_match = re.search(r"(고\s*[123])", subject_grade_in)
+                            grade_str = (
+                                grade_match.group(1).replace(" ", "")
+                                if grade_match
+                                else (extracted_book.grade or "고1")
+                            )
+                            book_id = f"{sanitize_id_part(book_title_in)}__{sanitize_id_part(subject_grade_in)}"
+                            record = ConceptBookRecord(
+                                id=book_id,
+                                book_title=book_title_in.strip(),
+                                subject=subject_grade_in.strip(),
+                                grade=grade_str,
+                                page_ranges_spec=page_ranges_in.strip(),
+                                units=extracted_book.units,
+                                created_by=current_user.username,
+                                created_at=datetime.now().isoformat(timespec="seconds"),
+                            )
+                            save_err = storage.save_concept_book(record)
+                            if save_err:
+                                st.warning(save_err)
+                            else:
+                                st.success(
+                                    f"🎉 공용 개념서 DB 저장 완료! (`{record.book_title}` · 총 {len(record.units)}개 단원 구조화 · "
+                                    + (
+                                        "로컬 ./concept_db 및 Google Drive 동기화 완료)"
+                                        if storage.drive_connected
+                                        else "로컬 ./concept_db 저장 완료)"
+                                    )
+                                )
+                        except Exception as exc:
+                            st.error(f"개념서 단원별 구조화 추출 실패: {exc}")
+
+    # 등록된 공용 개념서 DB 목록 조회 및 관리
+    st.markdown("---")
+    st.markdown("#### 🗂️ 등록된 공용 개념서·교과서 DB 목록 (`./concept_db` & Google Drive)")
+    saved_books = storage.load_concept_books()
+    if not saved_books:
+        st.info("아직 등록된 공용 개념서 DB가 없습니다. 위에서 개념서 PDF를 업로드해 첫 공용 DB를 구축해 보세요.")
+    else:
+        for b_idx, book in enumerate(saved_books):
+            with st.container(border=True):
+                b_col1, b_col2, b_col3 = st.columns([3, 1.2, 0.8])
+                with b_col1:
+                    st.markdown(f"##### 📗 {book.book_title} (`{book.subject}`)")
+                    st.caption(
+                        f"단원 수: **{len(book.units)}개** · 추출 페이지 구간: `{book.page_ranges_spec}` · "
+                        f"등록자: @{book.created_by or 'admin'}"
+                    )
+                with b_col2:
+                    schema_dict = {
+                        "book_title": book.book_title,
+                        "subject": book.subject,
+                        "grade": book.grade,
+                        "units": [u.model_dump() for u in book.units],
+                    }
+                    st.download_button(
+                        "📦 단원별 JSON 다운로드",
+                        data=json.dumps(schema_dict, ensure_ascii=False, indent=2).encode("utf-8"),
+                        file_name=f"{sanitize_id_part(book.book_title)}_concept_db.json",
+                        mime="application/json",
+                        key=f"{key_prefix}_dl_cb_{b_idx}_{book.id}",
+                        use_container_width=True,
+                    )
+                with b_col3:
+                    if st.button(
+                        "🗑️ 삭제",
+                        key=f"{key_prefix}_del_cb_{b_idx}_{book.id}",
+                        use_container_width=True,
+                    ):
+                        del_err = storage.delete_concept_book(book.id)
+                        if del_err:
+                            st.warning(del_err)
+                        st.rerun()
+
+                with st.expander(f"📋 `{book.book_title}` 단원별 개념 및 허용 용어 상세 보기 ({len(book.units)}개 단원)", expanded=False):
+                    for u_idx, unit in enumerate(book.units, start=1):
+                        st.markdown(f"**{u_idx}. {unit.unit_name}** (`{unit.page_range}`)")
+                        uc1, uc2 = st.columns(2)
+                        with uc1:
+                            st.caption("핵심 원리 및 정의 요약 (`core_concepts`)")
+                            render_chips(unit.core_concepts, variant="blue", limit=60)
+                        with uc2:
+                            st.caption("허용 용어·공식·단위 (`allowed_terms_and_units`)")
+                            render_chips(unit.allowed_terms_and_units, variant="green", limit=80)
+                        st.markdown("---")
+
+
 if is_admin:
-    tab1, tab2, admin_tab = st.tabs(
+    tab1, tab2, tab3, admin_tab = st.tabs(
         [
             "📥 탭 1: 모의고사 수집 & 2022 원리·용어 분해",
-            "🎯 탭 2: 개념서 PDF 범위 추출 & 상위 문제 개조",
+            "🎯 탭 2: 개념서 범위 추출 & 상위 문제 개조",
+            "📚 탭 3: 공용 개념서·교과서 DB 구축",
             "🛡️ 관리자: 회원 등급 관리",
         ]
     )
 else:
-    tab1, tab2 = st.tabs(
+    tab1, tab2, tab3 = st.tabs(
         [
             "📥 탭 1: 모의고사 수집 & 2022 원리·용어 분해",
-            "🎯 탭 2: 개념서 PDF 범위 추출 & 상위 문제 개조",
+            "🎯 탭 2: 개념서 범위 추출 & 상위 문제 개조",
+            "📚 탭 3: 공용 개념서·교과서 DB 구축",
         ]
     )
     admin_tab = None
@@ -1257,104 +1492,220 @@ with tab1:
 # TAB 2: 개념서·교과서 PDF 분석 → 엄격한 범위 내 추출 & 상위 문제 개조
 # ===========================================================================
 with tab2:
-    st.subheader("1️⃣ 개념서·교과서 PDF 업로드 & 페이지 범위 지정")
+    st.subheader("1️⃣ 기준 개념서 범위 설정 (공용 개념서 DB 선택 또는 PDF 직접 업로드)")
 
-    concept_file = st.file_uploader(
-        "통합과학·통합사회·공통수학 등 개념서/교과서 PDF 업로드",
-        type=["pdf"],
-        key="tab2_concept_pdf",
+    source_tab_db, source_tab_pdf = st.tabs(
+        [
+            "📚 공용 개념서·교과서 DB에서 단원 선택 (Pro · ADMIN 전용)",
+            "📄 개념서·교과서 PDF 1회성 직접 업로드",
+        ]
     )
 
-    concept_pdf_bytes: bytes | None = concept_file.getvalue() if concept_file is not None else None
-    if concept_pdf_bytes is not None:
-        cur_pdf_hash = hashlib.sha256(concept_pdf_bytes).hexdigest()[:16]
-        if st.session_state["concept_pdf_hash"] and st.session_state["concept_pdf_hash"] != cur_pdf_hash:
-            st.session_state["concept_whitelist"] = None
-            st.session_state["matched_items"] = []
-            st.session_state["generated_exam_pdf"] = None
-        st.session_state["concept_pdf_hash"] = cur_pdf_hash
+    with source_tab_db:
+        has_concept_db_access = can_access_shared_concept_db(current_user)
+        shared_books = storage.load_concept_books()
 
-        total_pages = get_pdf_page_count(concept_pdf_bytes)
-        p_col1, p_col2, p_col3 = st.columns([1, 1, 1.4])
-        with p_col1:
-            start_page = int(
-                st.number_input(
-                    "시작 페이지 (PDF 기준)",
-                    min_value=1,
-                    max_value=total_pages,
-                    value=1,
-                    step=1,
-                )
+        if not has_concept_db_access:
+            st.warning(
+                "🔒 **공용 개념서·교과서 DB 불러오기는 Pro(VIP) · ADMIN 등급 전용 기능입니다.**\n\n"
+                f"현재 등급(**{TIER_LABELS.get(current_user.tier, current_user.tier)}**)에서는 잠금 처리되어 있으며, "
+                "우측 **[📄 개념서·교과서 PDF 1회성 직접 업로드]** 탭에서 PDF를 직접 올려 이용하실 수 있습니다."
             )
-        with p_col2:
-            end_page = int(
-                st.number_input(
-                    "끝 페이지 (PDF 기준)",
-                    min_value=start_page,
-                    max_value=total_pages,
-                    value=min(total_pages, start_page + 4),
-                    step=1,
-                )
+            locked_options = (
+                [f"🔒 {b.book_title} ({b.subject})" for b in shared_books]
+                if shared_books
+                else ["🔒 등록된 공용 개념서 DB (Pro 이상 전용)"]
             )
-        with p_col3:
-            st.info(f"전체 {total_pages}쪽 중 **{start_page}쪽 ~ {end_page}쪽** (총 {end_page - start_page + 1}쪽) 선택됨")
-
-        with st.expander("👀 선택한 범위 첫 페이지(및 끝 페이지) 미리보기", expanded=True):
-            prev_c1, prev_c2 = st.columns(2)
-            with prev_c1:
-                st.image(
-                    render_pdf_page_png(concept_pdf_bytes, start_page, dpi=140),
-                    caption=f"시작 페이지 ({start_page}쪽)",
-                    use_container_width=True,
+            st.selectbox(
+                "공용 개념서·교과서 선택 (잠금)",
+                options=locked_options,
+                disabled=True,
+                key="locked_shared_book_select",
+            )
+        else:
+            if not shared_books:
+                st.info(
+                    "아직 Google Drive / `./concept_db`에 저장된 공용 개념서 DB가 없습니다. "
+                    "상단 **[📚 탭 3: 공용 개념서·교과서 DB 구축]** 또는 아래 패널에서 교재 PDF를 먼저 등록해 주세요."
                 )
-            with prev_c2:
-                if end_page != start_page:
-                    st.image(
-                        render_pdf_page_png(concept_pdf_bytes, end_page, dpi=140),
-                        caption=f"끝 페이지 ({end_page}쪽)",
-                        use_container_width=True,
-                    )
-                else:
-                    st.caption("단일 페이지가 선택되었습니다.")
-
-        if st.button("🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출", type="primary"):
-            if not active_gemini_key:
-                st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
             else:
-                with st.spinner(f"PDF {start_page}~{end_page}쪽의 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
-                    sliced_bytes, sliced_text, _ = extract_pdf_slice(
-                        concept_pdf_bytes, start_page, end_page
+                book_labels = [
+                    f"{b.book_title} ({b.subject} · {len(b.units)}개 단원)" for b in shared_books
+                ]
+                sel_book_idx = st.selectbox(
+                    "📖 공용 개념서·교과서 DB 선택",
+                    options=list(range(len(shared_books))),
+                    format_func=lambda idx: book_labels[idx],
+                    key="tab2_shared_book_idx",
+                )
+                chosen_book = shared_books[sel_book_idx]
+                st.caption(
+                    f"선택 교재: **{chosen_book.book_title}** | 과목/학년: `{chosen_book.subject}` | "
+                    f"추출 페이지 구간: `{chosen_book.page_ranges_spec}`"
+                )
+
+                st.markdown("**✅ 출제 및 개조 기준으로 사용할 단원을 체크하세요:**")
+                select_all_units = st.checkbox(
+                    "전체 단원 일괄 선택",
+                    value=True,
+                    key=f"sel_all_units_{chosen_book.id}",
+                )
+                selected_units_list: list[ConceptUnit] = []
+                for u_i, unit_obj in enumerate(chosen_book.units):
+                    checked = st.checkbox(
+                        f"{unit_obj.unit_name} ({unit_obj.page_range}) — 핵심개념 {len(unit_obj.core_concepts)}개 · 허용용어 {len(unit_obj.allowed_terms_and_units)}개",
+                        value=select_all_units,
+                        key=f"unit_chk_{chosen_book.id}_{u_i}",
                     )
-                    try:
-                        wl = extract_concept_whitelist(
-                            api_key=active_gemini_key,
-                            model_name=selected_model,
-                            sliced_pdf_bytes=sliced_bytes,
-                            sliced_text=sliced_text,
-                            start_page=start_page,
-                            end_page=end_page,
+                    if checked:
+                        selected_units_list.append(unit_obj)
+
+                if st.button(
+                    "📚 선택한 단원으로 지식 화이트리스트 즉시 적용",
+                    type="primary",
+                    use_container_width=True,
+                    key="apply_shared_concept_units_btn",
+                ):
+                    if not selected_units_list:
+                        st.error("최소 1개 이상의 단원을 체크해 주세요.")
+                    else:
+                        wl_from_db, ctx_text = build_whitelist_from_concept_units(
+                            book_title=chosen_book.book_title,
+                            subject=chosen_book.subject,
+                            grade=chosen_book.grade,
+                            selected_units=selected_units_list,
                         )
-                        st.session_state["concept_whitelist"] = wl
-                        st.session_state["concept_sliced_text"] = sliced_text
-                        st.session_state["concept_source_label"] = f"{concept_file.name} ({start_page}~{end_page}쪽)"
+                        unit_names_short = ", ".join(
+                            f"{u.unit_name}({u.page_range})" for u in selected_units_list[:3]
+                        )
+                        if len(selected_units_list) > 3:
+                            unit_names_short += f" 외 {len(selected_units_list) - 3}개 단원"
+                        st.session_state["concept_whitelist"] = wl_from_db
+                        st.session_state["concept_sliced_text"] = ctx_text
+                        st.session_state["concept_source_label"] = (
+                            f"{chosen_book.book_title} - {unit_names_short}"
+                        )
                         st.session_state["matched_items"] = []
                         st.session_state["generated_exam_pdf"] = None
-                        st.success("✅ PDF 지식 화이트리스트 추출이 완료되었습니다!")
-                    except Exception as exc:
-                        st.error(f"화이트리스트 추출 실패: {exc}")
+                        st.success(
+                            f"✅ 공용 개념서 `{chosen_book.book_title}`의 {len(selected_units_list)}개 단원이 출제·개조 기준으로 적용되었습니다!"
+                        )
+
+            with st.expander("➕ 새 개념서·교과서 PDF를 공용 DB에 바로 추가하기", expanded=not bool(shared_books)):
+                _render_concept_book_builder_section(key_prefix="tab2_inline")
+
+    with source_tab_pdf:
+        concept_file = st.file_uploader(
+            "통합과학·통합사회·공통수학 등 개념서/교과서 PDF 업로드",
+            type=["pdf"],
+            key="tab2_concept_pdf",
+        )
+
+        concept_pdf_bytes: bytes | None = concept_file.getvalue() if concept_file is not None else None
+        if concept_pdf_bytes is not None:
+            cur_pdf_hash = hashlib.sha256(concept_pdf_bytes).hexdigest()[:16]
+            if st.session_state["concept_pdf_hash"] and st.session_state["concept_pdf_hash"] != cur_pdf_hash:
+                st.session_state["concept_whitelist"] = None
+                st.session_state["matched_items"] = []
+                st.session_state["generated_exam_pdf"] = None
+            st.session_state["concept_pdf_hash"] = cur_pdf_hash
+
+            total_pages = get_pdf_page_count(concept_pdf_bytes)
+            default_book_name = re.sub(r"\.pdf$", "", concept_file.name, flags=re.IGNORECASE)
+            up_meta_c1, up_meta_c2 = st.columns([1, 1.4])
+            with up_meta_c1:
+                direct_book_title = st.text_input(
+                    "교재명 (결과 출처 표기용)",
+                    value=default_book_name,
+                    placeholder="예: 완자 통합과학",
+                    key="tab2_direct_book_title",
+                )
+            with up_meta_c2:
+                multi_range_str = st.text_input(
+                    "개념 페이지 범위 입력 (예: 12-25, 34-48 처럼 여러 구간 지정 가능)",
+                    value=f"1-{min(total_pages, 5)}",
+                    placeholder="예: 12-25, 34-48, 60-75",
+                    key="tab2_direct_page_ranges",
+                )
+
+            parsed_direct_ranges: list[tuple[int, int]] = []
+            try:
+                parsed_direct_ranges = parse_page_ranges_spec(multi_range_str, total_pages)
+                range_disp = ", ".join(
+                    f"p.{s}~p.{e}" if s != e else f"p.{s}" for s, e in parsed_direct_ranges
+                )
+                sel_cnt = sum(e - s + 1 for s, e in parsed_direct_ranges)
+                st.info(f"전체 {total_pages}쪽 중 **{range_disp}** (총 {sel_cnt}쪽) 선택됨")
+            except ValueError as ve:
+                st.error(str(ve))
+
+            if parsed_direct_ranges:
+                first_page_num = parsed_direct_ranges[0][0]
+                last_page_num = parsed_direct_ranges[-1][1]
+                with st.expander("👀 선택한 범위 첫 페이지(및 끝 페이지) 미리보기", expanded=True):
+                    prev_c1, prev_c2 = st.columns(2)
+                    with prev_c1:
+                        st.image(
+                            render_pdf_page_png(concept_pdf_bytes, first_page_num, dpi=140),
+                            caption=f"시작 페이지 ({first_page_num}쪽)",
+                            use_container_width=True,
+                        )
+                    with prev_c2:
+                        if last_page_num != first_page_num:
+                            st.image(
+                                render_pdf_page_png(concept_pdf_bytes, last_page_num, dpi=140),
+                                caption=f"끝 페이지 ({last_page_num}쪽)",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.caption("단일 페이지가 선택되었습니다.")
+
+                if st.button("🔍 1단계: 업로드된 PDF 지식 화이트리스트 추출", type="primary"):
+                    if not active_gemini_key:
+                        st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
+                    else:
+                        with st.spinner(f"PDF ({range_disp})의 순수 개념 본문·도표·용어를 정독해 화이트리스트를 구축 중..."):
+                            sliced_bytes, sliced_text, slice_stats = extract_concept_pages_by_ranges(
+                                concept_pdf_bytes, parsed_direct_ranges
+                            )
+                            try:
+                                wl = extract_concept_whitelist(
+                                    api_key=active_gemini_key,
+                                    model_name=selected_model,
+                                    sliced_pdf_bytes=sliced_bytes,
+                                    sliced_text=sliced_text,
+                                    start_page=first_page_num,
+                                    end_page=last_page_num,
+                                    book_title=direct_book_title.strip() or default_book_name,
+                                    range_display=slice_stats["ranges_display"],
+                                )
+                                st.session_state["concept_whitelist"] = wl
+                                st.session_state["concept_sliced_text"] = sliced_text
+                                st.session_state["concept_source_label"] = (
+                                    f"{direct_book_title.strip() or concept_file.name} ({slice_stats['ranges_display']})"
+                                )
+                                st.session_state["matched_items"] = []
+                                st.session_state["generated_exam_pdf"] = None
+                                st.success("✅ PDF 지식 화이트리스트 추출이 완료되었습니다!")
+                            except Exception as exc:
+                                st.error(f"화이트리스트 추출 실패: {exc}")
 
     # 추출된 화이트리스트 표시
     whitelist: ConceptWhitelist | None = st.session_state.get("concept_whitelist")
     if whitelist is not None:
-        st.markdown("### 📋 추출된 PDF 지식 화이트리스트 (이 범위만 학습한 것으로 간주)")
+        st.markdown("### 📋 현재 적용된 개념서 지식 화이트리스트 (이 범위만 학습한 것으로 간주)")
         with st.container(border=True):
-            st.write(f"**추정 과목:** `{whitelist.subject_guess}` | **범위 요약:** {whitelist.pdf_summary}")
+            book_badge = f"**기준 교재:** `{whitelist.book_title}` | " if whitelist.book_title else ""
+            st.write(f"{book_badge}**추정 과목:** `{whitelist.subject_guess}` | **범위 요약:** {whitelist.pdf_summary}")
+            if whitelist.units:
+                unit_badges = [f"{u.unit_name} ({u.page_range})" for u in whitelist.units]
+                st.caption("📖 **적용 단원 및 페이지:** " + " · ".join(unit_badges))
             w_c1, w_c2 = st.columns(2)
             with w_c1:
-                st.markdown(f"**이 PDF에 실제로 설명된 개념·원리 (`pdf_concepts`, {len(whitelist.pdf_concepts)}개)**")
+                st.markdown(f"**이 범위에 실제로 설명된 개념·원리 (`pdf_concepts`, {len(whitelist.pdf_concepts)}개)**")
                 render_chips(whitelist.pdf_concepts, variant="blue", limit=100)
             with w_c2:
-                st.markdown(f"**이 PDF에 실제로 등장하는 허용 용어 (`pdf_vocabulary`, {len(whitelist.pdf_vocabulary)}개)**")
+                st.markdown(f"**이 범위에 실제로 등장하는 허용 용어 (`pdf_vocabulary`, {len(whitelist.pdf_vocabulary)}개)**")
                 render_chips(whitelist.pdf_vocabulary, variant="green", limit=120)
 
             with st.expander("✏️ 필요 시 허용 개념/용어 수동 보완하기"):
@@ -1442,7 +1793,7 @@ with tab2:
                     )
                     auto_rewrite_mode = False
 
-            if st.button("🚀 기출 매칭 & PDF 맞춤 문제 추출·개조 실행", type="primary"):
+            if st.button("🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행", type="primary"):
                 db_list = storage.load_db()
                 if not is_premium and (remaining_quota or 0) <= 0:
                     st.error(
@@ -1470,7 +1821,7 @@ with tab2:
                     if not candidates:
                         st.warning("선택한 과목/학년/단일개념 조건에 맞는 후보 문항이 DB에 없습니다.")
                     else:
-                        with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 PDF 범위와 대조 중..."):
+                        with st.spinner(f"후보 {len(candidates)}개 문항의 핵심 원리를 개념서 범위와 대조 중..."):
                             try:
                                 judgments = match_questions_to_whitelist(
                                     api_key=active_gemini_key,
@@ -1511,7 +1862,7 @@ with tab2:
 
                         if not selected_pairs:
                             st.warning(
-                                "업로드된 PDF의 개념만으로 풀 수 있는 문항이 없습니다."
+                                "선택한 개념서 범위의 개념만으로 풀 수 있는 문항이 없습니다."
                                 + (
                                     f" (단, CUSTOM/PRO 등급에서 '상위 과목 문제 자동 개조 모드'를 켜면 원리가 일치하는 {skipped_needs_rewrite}문항을 개조해 출제할 수 있습니다.)"
                                     if skipped_needs_rewrite > 0
@@ -1527,6 +1878,12 @@ with tab2:
                             for idx, (q, j) in enumerate(selected_pairs, start=1):
                                 crop_bytes = storage.get_crop_bytes(q.image_filename)
                                 rewritten_obj: RewrittenQuestion | None = None
+                                concept_ref = resolve_question_concept_reference(
+                                    question=q,
+                                    judgment=j,
+                                    whitelist=whitelist,
+                                    fallback_source_label=st.session_state.get("concept_source_label", ""),
+                                )
 
                                 if j.needs_rewriting and auto_rewrite_mode:
                                     stat.info(
@@ -1553,6 +1910,7 @@ with tab2:
                                         "judgment": j,
                                         "crop_png_bytes": crop_bytes,
                                         "rewritten": rewritten_obj,
+                                        "concept_reference": concept_ref,
                                     }
                                 )
                                 prog.progress(idx / len(selected_pairs))
@@ -1577,7 +1935,7 @@ with tab2:
                             st.success(
                                 f"🎯 총 {len(assembled)}문항 추출 완료! "
                                 f"(원문 그대로 {sum(1 for it in assembled if it['rewritten'] is None)}문항 · "
-                                f"PDF 기준 개조 {sum(1 for it in assembled if it['rewritten'] is not None)}문항){rem_msg}"
+                                f"개념서 기준 개조 {sum(1 for it in assembled if it['rewritten'] is not None)}문항){rem_msg}"
                             )
 
     # -----------------------------------------------------------------------
@@ -1593,9 +1951,15 @@ with tab2:
                     if (j.is_solvable_by_pdf_only and not j.needs_rewriting)
                     else ("원리 일치 → 상위 용어 개조 대상" if j.is_solvable_by_pdf_only else "범위 외 원리 포함 (제외)")
                 )
+                ref_preview = ""
+                if j.is_solvable_by_pdf_only:
+                    ref_preview = " | " + resolve_question_concept_reference(
+                        q, j, whitelist, fallback_source_label=st.session_state.get("concept_source_label", "")
+                    )
                 st.write(
                     f"{icon} **{q.exam_name} {q.q_num}번** [{status_lbl}] — {j.matching_reason}"
                     + (f" | 범위 외 용어: `{', '.join(j.out_of_scope_terms)}`" if j.out_of_scope_terms else "")
+                    + ref_preview
                 )
 
     if matched_items:
@@ -1660,7 +2024,7 @@ with tab2:
 
         # ----- 모드 B: 웹에서 바로 풀기 & 자동 채점 + AI 자동 해설 -----
         with mode_tab_b:
-            st.markdown("#### ✏️ 실전 풀이 & 자동 채점 + PDF 기반 AI 자동 해설")
+            st.markdown("#### ✏️ 실전 풀이 & 자동 채점 + 개념서 기반 AI 자동 해설")
 
             # 채점 완료 시 상단 성적표 배너
             if st.session_state.get("graded"):
@@ -1682,6 +2046,12 @@ with tab2:
                 crop_b = item.get("crop_png_bytes")
                 rw = item.get("rewritten")
                 truth_ans = rw.preserved_answer if rw else q.answer
+                concept_ref_str = (
+                    item.get("concept_reference")
+                    or resolve_question_concept_reference(
+                        q, j, whitelist, fallback_source_label=st.session_state.get("concept_source_label", "")
+                    )
+                )
 
                 with st.container(border=True):
                     # 카드 상단 헤더 + 배지
@@ -1693,7 +2063,7 @@ with tab2:
                         )
                     with hdr_col2:
                         if rw is not None:
-                            st.markdown("<span class='chip chip-blue'>✨ PDF 기준 개조 문항</span>", unsafe_allow_html=True)
+                            st.markdown("<span class='chip chip-blue'>✨ 개념서 기준 개조 문항</span>", unsafe_allow_html=True)
                         else:
                             st.markdown("<span class='chip chip-green'>📌 원문 그대로 출제</span>", unsafe_allow_html=True)
 
@@ -1726,6 +2096,14 @@ with tab2:
                             st.image(crop_b, use_container_width=True)
                         else:
                             st.warning("문항 이미지를 불러올 수 없습니다.")
+
+                    # 문항 카드 하단: 참고 개념서 단원 및 페이지 번호 표기
+                    st.markdown(
+                        f"<div style='background:#EFF6FF; border-left:4px solid #2563EB; padding:8px 12px; "
+                        f"border-radius:6px; margin:8px 0; font-size:0.9rem; font-weight:600; color:#1E3A8A;'>"
+                        f"{_html.escape(concept_ref_str)}</div>",
+                        unsafe_allow_html=True,
+                    )
 
                     # 답안 입력 UI (객관식 1~5 터치 버튼 또는 주관식 입력)
                     st.markdown("**내 답안 선택 / 입력:**")
@@ -1775,6 +2153,7 @@ with tab2:
                                 st.markdown(rw.pdf_grounded_explanation)
                             else:
                                 st.markdown(q.official_explanation)
+                            st.caption(concept_ref_str)
 
                     # ✨ AI 자동 해설 버튼 & 추가 질문 채팅
                     ai_col1, ai_col2 = st.columns([1, 2])
@@ -1785,7 +2164,7 @@ with tab2:
                             elif whitelist is None:
                                 st.error("개념서 화이트리스트가 필요합니다.")
                             else:
-                                with st.spinner("업로드하신 개념서 PDF 용어만 사용하여 맞춤 해설 작성 중..."):
+                                with st.spinner("개념서 범위 내 용어만 사용하여 맞춤 해설 작성 중..."):
                                     try:
                                         exp_md = generate_pdf_grounded_explanation(
                                             api_key=active_gemini_key,
@@ -1796,14 +2175,17 @@ with tab2:
                                             user_answer=st.session_state["user_answers"].get(q.id, ""),
                                             rewritten=rw,
                                             sliced_text=st.session_state.get("concept_sliced_text", ""),
+                                            concept_reference=concept_ref_str,
                                         )
                                         st.session_state["ai_explanations"][q.id] = exp_md
                                     except Exception as exc:
                                         st.error(f"AI 해설 생성 실패: {exc}")
 
                     if q.id in st.session_state["ai_explanations"]:
-                        st.info("✨ **업로드한 개념서 PDF 기준 AI 맞춤 해설**")
+                        st.info("✨ **개념서 범위 기준 AI 맞춤 해설**")
                         st.markdown(st.session_state["ai_explanations"][q.id])
+                        if concept_ref_str not in st.session_state["ai_explanations"][q.id]:
+                            st.markdown(f"**{_html.escape(concept_ref_str)}**")
 
                         # 문항별 추가 질문 채팅
                         st.markdown("💬 **추가 질문 채팅 (개념서 범위 내 1:1 질의응답)**")
@@ -1855,6 +2237,12 @@ with tab2:
                     st.session_state["user_answers"] = {}
                     st.session_state["graded"] = False
                     st.rerun()
+
+# ===========================================================================
+# TAB 3: 관리자 / Pro 전용 공용 개념서·교과서 DB 구축 및 관리
+# ===========================================================================
+with tab3:
+    _render_concept_book_builder_section(key_prefix="tab3")
 
 if admin_tab is not None:
     with admin_tab:

@@ -86,8 +86,48 @@ class QuestionExtractionOutput(BaseModel):
     official_explanation: str = Field(..., description="공식 해설의 핵심 풀이 요약")
 
 
+class ConceptUnit(BaseModel):
+    """단원별 개념 요약·허용 용어 및 실제 페이지 번호 스키마."""
+
+    unit_name: str = Field(..., description="단원명 (예: Ⅲ. 변화와 다양성 - 1. 산화와 환원)")
+    page_range: str = Field(..., description="실제 개념서 페이지 범위 (예: p.12 ~ p.25)")
+    core_concepts: list[str] = Field(
+        default_factory=list,
+        description="핵심 원리 및 정의 요약 리스트",
+    )
+    allowed_terms_and_units: list[str] = Field(
+        default_factory=list,
+        description="해당 단원에서 허용되는 용어, 공식, 단위 리스트 (예: mL, 온도, 이온 수 등)",
+    )
+
+
+class ConceptBookExtractionOutput(BaseModel):
+    """Gemini가 개념서 PDF 지정 페이지들로부터 추출하는 단원별 구조화 스키마."""
+
+    book_title: str = Field(..., description="교재명 (예: 완자 통합과학)")
+    subject: str = Field(..., description="과목명 (예: 통합과학)")
+    grade: str = Field(..., description="학년 (예: 고1)")
+    units: list[ConceptUnit] = Field(
+        default_factory=list,
+        description="단원(대단원/중단원)별 개념 및 허용 용어 구조화 목록",
+    )
+
+
+class ConceptBookRecord(BaseModel):
+    """./concept_db 및 Google Drive 공용 폴더에 저장되는 개념서·교과서 DB 레코드."""
+
+    id: str = Field(..., description="고유 개념서 ID (예: 완자_통합과학__고1_통합과학)")
+    book_title: str = Field(..., description="교재명")
+    subject: str = Field(..., description="과목 및 학년 표기")
+    grade: str = Field(default="고1", description="학년 표기 (예: 고1)")
+    page_ranges_spec: str = Field(default="", description="추출 시 입력한 개념 페이지 범위 (예: 12-25, 34-48)")
+    units: list[ConceptUnit] = Field(default_factory=list, description="단원별 개념 목록")
+    created_by: str = Field(default="", description="업로드한 사용자 아이디")
+    created_at: str = Field(default="", description="생성 시각 (ISO 8601)")
+
+
 class ConceptWhitelist(BaseModel):
-    """업로드된 개념서·교과서 PDF 지정 페이지에서 추출한 지식 화이트리스트."""
+    """업로드된 개념서·교과서 PDF 지정 페이지 또는 공용 개념서 DB에서 추출한 지식 화이트리스트."""
 
     subject_guess: str = Field(..., description="PDF 내용 기반 추정 과목명")
     pdf_summary: str = Field(..., description="지정 페이지 범위의 핵심 학습 내용 요약")
@@ -98,6 +138,12 @@ class ConceptWhitelist(BaseModel):
     pdf_vocabulary: list[str] = Field(
         ...,
         description="이 PDF에 실제로 등장하여 학생이 이해할 수 있는 허용 용어·기호·단위 목록",
+    )
+    book_title: str = Field(default="", description="참고 교재명 (예: 완자 통합과학)")
+    grade: str = Field(default="", description="학년 정보 (예: 고1)")
+    units: list[ConceptUnit] = Field(
+        default_factory=list,
+        description="단원별 개념 및 페이지 범위 메타데이터 목록",
     )
 
 
@@ -118,6 +164,14 @@ class QuestionMatchJudgment(BaseModel):
         description="원리는 PDF로 해결 가능(is_solvable_by_pdf_only=True)하지만 out_of_scope_terms가 존재하여 개조가 필요하면 True",
     )
     matching_reason: str = Field(..., description="매칭 또는 제외 사유 간략 설명")
+    matched_unit_name: str = Field(
+        default="",
+        description="이 문항의 풀이 원리가 수록된 개념서 단원명 (예: Ⅲ. 변화와 다양성)",
+    )
+    matched_page_range: str = Field(
+        default="",
+        description="이 문항의 풀이 원리가 수록된 개념서 페이지 번호 (예: p.184~189)",
+    )
 
 
 class BatchMatchResult(BaseModel):
@@ -196,6 +250,7 @@ def infer_subject_category(subject: str) -> SubjectCategory:
 TierType = Literal["FREE", "CUSTOM", "PRO", "ADMIN"]
 LEGACY_TIER_MAP: dict[str, str] = {
     "BYOK": "CUSTOM",
+    "VIP": "PRO",
     "ULTRA": "ADMIN",
 }
 
@@ -217,4 +272,110 @@ class UserRecord(BaseModel):
     def _normalize_legacy_tier(cls, value: Any) -> str:
         raw = str(value or "FREE").strip().upper()
         return LEGACY_TIER_MAP.get(raw, raw)
+
+
+def build_whitelist_from_concept_units(
+    book_title: str,
+    subject: str,
+    grade: str,
+    selected_units: list[ConceptUnit],
+) -> tuple[ConceptWhitelist, str]:
+    """공용 개념서 DB에서 선택한 단원 목록을 기존 매칭·개조 엔진용 ConceptWhitelist와 보조 텍스트로 변환한다."""
+    concepts: list[str] = []
+    vocab: list[str] = []
+    unit_summaries: list[str] = []
+    context_blocks: list[str] = []
+
+    for u in selected_units:
+        for c in u.core_concepts:
+            if c.strip() and c.strip() not in concepts:
+                concepts.append(c.strip())
+        for v in u.allowed_terms_and_units:
+            if v.strip() and v.strip() not in vocab:
+                vocab.append(v.strip())
+        unit_summaries.append(f"{u.unit_name} ({u.page_range})")
+        context_blocks.append(
+            f"[{book_title} | {u.unit_name} ({u.page_range})]\n"
+            f"- 핵심 개념: {', '.join(u.core_concepts)}\n"
+            f"- 허용 용어·단위: {', '.join(u.allowed_terms_and_units)}"
+        )
+
+    summary_str = (
+        f"{book_title} ({subject}) 선택 단원: " + ", ".join(unit_summaries)
+        if unit_summaries
+        else f"{book_title} ({subject})"
+    )
+    wl = ConceptWhitelist(
+        subject_guess=subject,
+        pdf_summary=summary_str,
+        pdf_concepts=concepts,
+        pdf_vocabulary=vocab,
+        book_title=book_title,
+        grade=grade,
+        units=list(selected_units),
+    )
+    return wl, "\n\n".join(context_blocks)
+
+
+def resolve_question_concept_reference(
+    question: QuestionRecord,
+    judgment: QuestionMatchJudgment | None,
+    whitelist: ConceptWhitelist | None,
+    fallback_source_label: str = "",
+) -> str:
+    """
+    매칭·개조된 문항에 대해
+    '📖 참고 개념: {교재명} - {단원명} ({페이지 범위})'
+    형식의 출처 문자열을 결정한다.
+    """
+    book_title = (whitelist.book_title if whitelist and whitelist.book_title else "").strip()
+    unit_name = (judgment.matched_unit_name if judgment and judgment.matched_unit_name else "").strip()
+    page_range = (judgment.matched_page_range if judgment and judgment.matched_page_range else "").strip()
+
+    units = whitelist.units if whitelist and whitelist.units else []
+
+    if units:
+        # 1) judgment의 matched_unit_name과 일치하거나 포함 관계인 단원 탐색
+        matched_unit: ConceptUnit | None = None
+        if unit_name:
+            for u in units:
+                if u.unit_name == unit_name or unit_name in u.unit_name or u.unit_name in unit_name:
+                    matched_unit = u
+                    break
+
+        # 2) 없으면 문항의 core_principles / unit_name과 가장 많이 겹치는 단원 탐색
+        if matched_unit is None:
+            best_score = -1
+            q_keywords = set(question.core_principles) | {question.unit_name}
+            for u in units:
+                score = 0
+                u_blob = " ".join([u.unit_name] + u.core_concepts + u.allowed_terms_and_units)
+                for kw in q_keywords:
+                    for token in kw.split():
+                        if len(token) >= 2 and token in u_blob:
+                            score += 2
+                if score > best_score:
+                    best_score = score
+                    matched_unit = u
+
+        if matched_unit is None:
+            matched_unit = units[0]
+
+        unit_name = matched_unit.unit_name
+        page_range = matched_unit.page_range
+
+    if not book_title:
+        book_title = fallback_source_label.strip() or (whitelist.subject_guess if whitelist else "개념서 PDF")
+
+    if not unit_name:
+        unit_name = (whitelist.subject_guess if whitelist and whitelist.subject_guess else question.unit_name) or "지정 개념 범위"
+
+    if page_range:
+        clean_p = page_range.strip()
+        if not clean_p.lower().startswith("p"):
+            clean_p = f"p.{clean_p}"
+        return f"📖 참고 개념: {book_title} - {unit_name} ({clean_p})"
+
+    return f"📖 참고 개념: {book_title} - {unit_name}"
+
 

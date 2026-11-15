@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from src.exporters import build_exam_html, build_exam_markdown
-from src.models import QuestionRecord, UserRecord
+from src.models import ConceptBookRecord, QuestionRecord, UserRecord
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -35,6 +35,7 @@ class StorageManager:
         service_account_info: dict[str, Any] | None = None,
         drive_folder_id: str = "",
         oauth_info: dict[str, Any] | None = None,
+        concept_root: str | Path = "./concept_db",
     ) -> None:
         self.local_root = Path(local_root)
         self.pdfs_dir = self.local_root / "pdfs"
@@ -43,10 +44,14 @@ class StorageManager:
         self.db_path = self.local_root / "db.json"
         self.users_path = self.local_root / "users.json"
 
+        self.concept_root = Path(concept_root)
+        self.concept_books_path = self.concept_root / "concept_books.json"
+
         self.local_root.mkdir(parents=True, exist_ok=True)
         self.pdfs_dir.mkdir(parents=True, exist_ok=True)
         self.crops_dir.mkdir(parents=True, exist_ok=True)
         self.organized_dir.mkdir(parents=True, exist_ok=True)
+        self.concept_root.mkdir(parents=True, exist_ok=True)
 
         self.drive_folder_id = drive_folder_id.strip()
         self.service_account_info = service_account_info
@@ -316,13 +321,41 @@ class StorageManager:
                 )
                 result["users_synced"] = True
 
+            # 1-c) 공용 개념서 DB (concept_books.json 및 concept_db 하위 JSON) 동기화
+            cbook_files = self._list_children(
+                self.drive_folder_id,
+                extra_query="name = 'concept_books.json'",
+            )
+            if cbook_files:
+                cb_bytes = self._download_file_bytes(cbook_files[0]["id"])
+                self.concept_books_path.write_bytes(cb_bytes)
+                result["concept_books_synced"] = True
+            elif self.concept_books_path.exists():
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "concept_books.json",
+                    self.concept_books_path.read_bytes(),
+                    "application/json",
+                )
+                result["concept_books_synced"] = True
+
+            concept_dir_id = self._find_drive_subfolder("concept_db")
+            if concept_dir_id:
+                for item in self._list_children(concept_dir_id, extra_query=f"mimeType != '{FOLDER_MIME}'"):
+                    if not item["name"].lower().endswith(".json"):
+                        continue
+                    target = self.concept_root / item["name"]
+                    remote_size = int(item.get("size", 0) or 0)
+                    if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
+                        target.write_bytes(self._download_file_bytes(item["id"]))
+
             # 2) 과목별/회차별 폴더 동기화 (수학/사회/과학/<회차명>/*)
             for root_item in self._list_children(
                 self.drive_folder_id,
                 extra_query=f"mimeType = '{FOLDER_MIME}'",
             ):
                 fname = root_item["name"]
-                if fname in ("crops", "pdfs"):
+                if fname in ("crops", "pdfs", "concept_db"):
                     continue
                 subj_dir_name = _safe_segment(fname)
                 for exam_item in self._list_children(
@@ -507,6 +540,110 @@ class StorageManager:
                 )
             except Exception as exc:
                 return f"로컬 users.json 저장 완료 / Drive 동기화 오류: {exc}"
+        return None
+
+    def load_concept_books(self) -> list[ConceptBookRecord]:
+        """로컬 ./concept_db 에 저장된 공용 개념서·교과서 DB 목록을 불러온다."""
+        books_map: dict[str, ConceptBookRecord] = {}
+        if self.concept_books_path.exists():
+            try:
+                raw = json.loads(self.concept_books_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    for item in raw:
+                        b = ConceptBookRecord.model_validate(item)
+                        books_map[b.id] = b
+            except Exception:
+                pass
+
+        # 개별 JSON 파일(./concept_db/*.json)도 스캔해 병합
+        if self.concept_root.exists():
+            for child in sorted(self.concept_root.glob("*.json")):
+                if child.name == "concept_books.json":
+                    continue
+                try:
+                    item = json.loads(child.read_text(encoding="utf-8"))
+                    if isinstance(item, dict) and "book_title" in item and "units" in item:
+                        if "id" not in item:
+                            item["id"] = child.stem
+                        b = ConceptBookRecord.model_validate(item)
+                        books_map.setdefault(b.id, b)
+                except Exception:
+                    continue
+
+        return sorted(books_map.values(), key=lambda x: (x.subject, x.book_title))
+
+    def save_concept_book(self, book: ConceptBookRecord) -> str | None:
+        """
+        단원별 구조화된 개념서 레코드를 로컬(./concept_db) 및 Google Drive 공용 폴더에 자동 동기화 저장한다.
+        """
+        self.concept_root.mkdir(parents=True, exist_ok=True)
+        existing = {b.id: b for b in self.load_concept_books()}
+        existing[book.id] = book
+        all_books = sorted(existing.values(), key=lambda x: (x.subject, x.book_title))
+
+        # 1) 통합 인덱스(./concept_db/concept_books.json) 저장
+        all_payload = [b.model_dump() for b in all_books]
+        all_raw_text = json.dumps(all_payload, ensure_ascii=False, indent=2)
+        self.concept_books_path.write_text(all_raw_text, encoding="utf-8")
+
+        # 2) 개별 개념서 JSON 파일(./concept_db/<safe_id>.json) 저장
+        book_filename = f"{_safe_segment(book.id)}.json"
+        single_payload = book.model_dump()
+        single_raw_text = json.dumps(single_payload, ensure_ascii=False, indent=2)
+        (self.concept_root / book_filename).write_text(single_raw_text, encoding="utf-8")
+
+        if self.drive_connected:
+            errors: list[str] = []
+            try:
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "concept_books.json",
+                    all_raw_text.encode("utf-8"),
+                    "application/json",
+                )
+            except Exception as exc:
+                errors.append(f"concept_books.json 업로드 오류: {exc}")
+
+            try:
+                concept_folder_id = self._ensure_drive_subfolder("concept_db")
+                if concept_folder_id:
+                    self._upsert_drive_file(
+                        concept_folder_id,
+                        book_filename,
+                        single_raw_text.encode("utf-8"),
+                        "application/json",
+                    )
+            except Exception as exc:
+                errors.append(f"concept_db/{book_filename} 업로드 오류: {exc}")
+
+            if errors:
+                return f"로컬 ./concept_db 저장 완료 / Drive 동기화 경고: {' / '.join(errors)}"
+        return None
+
+    def delete_concept_book(self, book_id: str) -> str | None:
+        """공용 개념서 DB에서 특정 개념서를 삭제하고 Google Drive에도 반영한다."""
+        remaining = [b for b in self.load_concept_books() if b.id != book_id]
+        all_raw_text = json.dumps([b.model_dump() for b in remaining], ensure_ascii=False, indent=2)
+        self.concept_books_path.write_text(all_raw_text, encoding="utf-8")
+
+        book_filename = f"{_safe_segment(book_id)}.json"
+        (self.concept_root / book_filename).unlink(missing_ok=True)
+
+        if self.drive_connected and self.drive_service:
+            try:
+                self._upsert_drive_file(
+                    self.drive_folder_id,
+                    "concept_books.json",
+                    all_raw_text.encode("utf-8"),
+                    "application/json",
+                )
+                concept_folder_id = self._find_drive_subfolder("concept_db")
+                if concept_folder_id:
+                    safe_name = book_filename.replace("'", "\\'")
+                    for item in self._list_children(concept_folder_id, extra_query=f"name = '{safe_name}'"):
+                        self._trash_drive_item(item["id"])
+            except Exception as exc:
+                return f"로컬 삭제 완료 / Drive 반영 경고: {exc}"
         return None
 
     def save_crop_png(
@@ -875,7 +1012,10 @@ class StorageManager:
         if self.drive_connected and self.drive_service:
             try:
                 for item in self._list_children(self.drive_folder_id):
-                    if not delete_users and item.get("name") == "users.json":
+                    item_name = item.get("name", "")
+                    if not delete_users and item_name == "users.json":
+                        continue
+                    if item_name in ("concept_books.json", "concept_db"):
                         continue
                     self._trash_drive_item(item["id"])
                     trashed_drive += 1

@@ -13,6 +13,7 @@ __pycache__/
 
 # Local database & sensitive key JSON files
 exam_db/
+concept_db/
 *.json
 
 # OS & editor artifacts

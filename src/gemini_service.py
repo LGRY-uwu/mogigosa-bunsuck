@@ -13,6 +13,8 @@ from pydantic import BaseModel, Field
 from src.config import DEFAULT_MODEL, HYDROGEN_MODEL, resolve_api_model_name
 from src.models import (
     BatchMatchResult,
+    ConceptBookExtractionOutput,
+    ConceptUnit,
     ConceptWhitelist,
     ExamHeaderMetadata,
     QuestionExtractionOutput,
@@ -470,6 +472,64 @@ def analyze_question_with_gemini(
     return _parse_structured(resp, QuestionExtractionOutput)
 
 
+def extract_concept_book_units(
+    api_key: str,
+    model_name: str,
+    book_title: str,
+    subject_and_grade: str,
+    page_ranges_display: str,
+    sliced_pdf_bytes: bytes,
+    mapped_concept_text: str,
+) -> ConceptBookExtractionOutput:
+    """
+    지정된 페이지 범위에서 추출된 개념 텍스트(및 슬라이스 PDF)를
+    사이드바 선택 Gemini 모델(model_name)로 분석하여 단원별(대단원/중단원) 개념 + 페이지 번호 구조화 DB를 생성한다.
+    """
+    client = _build_client(api_key, timeout_seconds=60)
+    pdf_part = prepare_pdf_part(client, sliced_pdf_bytes, display_name="concept_book_slice.pdf")
+
+    system_inst = (
+        "당신은 2022 개정 교육과정 개념서·교과서 구조화 전문가입니다.\n"
+        "제공된 개념서 PDF 페이지들과 페이지 번호가 매핑된 텍스트(`=== [실제 페이지: p.X] ===`)를 분석하여 "
+        "단원(대단원/중단원)별로 정확히 정리하세요.\n"
+        "엄격 준수 규칙:\n"
+        "1. 불필요한 목차, 정답지, 문제 풀이 내용은 제외하고 순수 개념 설명만 구조화하세요.\n"
+        "2. 각 단원(`units`)의 `unit_name`은 대단원/중단원명을 명확히 적으세요 (예: 'Ⅰ. 물질과 규칙성 - 1. 원소의 생성', 'Ⅲ. 변화와 다양성').\n"
+        "3. `page_range`는 반드시 텍스트에 표시된 실제 페이지 번호를 기준으로 `'p.12 ~ p.25'` 형태로 정확히 표기하세요.\n"
+        "4. `core_concepts`에는 해당 단원 페이지에 실제로 설명된 핵심 원리, 법칙, 정의, 공식을 구체적으로 나열하세요.\n"
+        "5. `allowed_terms_and_units`에는 해당 단원 페이지에 실제로 등장하여 학생이 사용할 수 있는 모든 교과 용어, 기호, 공식, 단위(예: mL, 온도, 이온 수 등)를 빠짐없이 나열하세요.\n"
+        "6. 제공된 페이지 범위에 없는 상위 과목 개념이나 다른 단원 용어를 절대 임의로 추가하지 마세요."
+    )
+
+    excerpt = mapped_concept_text[:28000] if mapped_concept_text else "(이미지 중심 개념서 PDF)"
+    prompt = (
+        f"- 교재명(book_title): {book_title}\n"
+        f"- 과목 및 학년(subject / grade): {subject_and_grade}\n"
+        f"- 추출 대상 개념 페이지 범위: {page_ranges_display}\n\n"
+        "첨부된 개념서 슬라이스 PDF와 아래 페이지별 추출 텍스트를 정독한 뒤, "
+        "단원별로 구분하여 JSON 스키마(book_title, subject, grade, units)에 맞게 반환하세요.\n\n"
+        f"[페이지별 개념 텍스트]\n{excerpt}"
+    )
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=[pdf_part, prompt],
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=ConceptBookExtractionOutput,
+            temperature=0.0,
+        ),
+    )
+    parsed = _parse_structured(resp, ConceptBookExtractionOutput)
+    if book_title.strip():
+        parsed.book_title = book_title.strip()
+    if subject_and_grade.strip():
+        parsed.subject = subject_and_grade.strip()
+    return parsed
+
+
 def extract_concept_whitelist(
     api_key: str,
     model_name: str,
@@ -477,6 +537,8 @@ def extract_concept_whitelist(
     sliced_text: str,
     start_page: int,
     end_page: int,
+    book_title: str = "",
+    range_display: str = "",
 ) -> ConceptWhitelist:
     """업로드된 개념서·교과서 PDF 지정 페이지 범위에서 허용 개념과 허용 용어 화이트리스트를 추출한다."""
     client = _build_client(api_key)
@@ -488,14 +550,18 @@ def extract_concept_whitelist(
         "뒤 단원이나 상위 과목에 나오는 개념·용어를 절대 추측하거나 추가하지 마세요.\n"
         "1. pdf_concepts: 이 페이지 범위에서 실제로 설명·정의·예시된 개념, 원리, 법칙, 계산 방법을 빠짐없이 나열하세요.\n"
         "2. pdf_vocabulary: 이 페이지 범위 본문, 그림, 표, 공식, 용어 사전 박스에 실제로 등장하는 "
-        "모든 교과 용어, 기호, 단위를 나열하세요."
+        "모든 교과 용어, 기호, 단위를 나열하세요.\n"
+        "3. units: 이 페이지 범위에 포함된 단원명(unit_name), 페이지 범위(page_range, 예: 'p.12 ~ p.25'), "
+        "핵심 개념(core_concepts), 허용 용어·단위(allowed_terms_and_units)를 단원별로 함께 정리하세요."
     )
 
-    excerpt = sliced_text[:12000] if sliced_text else "(이미지 중심 PDF)"
+    effective_range = range_display.strip() or f"p.{start_page} ~ p.{end_page}"
+    excerpt = sliced_text[:15000] if sliced_text else "(이미지 중심 PDF)"
     prompt = (
-        f"대상 PDF 페이지 범위: {start_page}쪽 ~ {end_page}쪽\n"
+        f"교재명: {book_title or '업로드 개념서 PDF'}\n"
+        f"대상 PDF 페이지 범위: {effective_range}\n"
         "첨부된 PDF 페이지(텍스트 및 그림·도표 포함)를 정독한 뒤, "
-        "이 페이지 범위 안에 실제로 존재하는 개념·원리(pdf_concepts)와 허용 용어(pdf_vocabulary)만 추출하세요.\n\n"
+        "이 페이지 범위 안에 실제로 존재하는 개념·원리(pdf_concepts), 허용 용어(pdf_vocabulary), 그리고 단원별 정보(units)를 추출하세요.\n\n"
         f"[보조 추출 텍스트]\n{excerpt}"
     )
 
@@ -510,7 +576,19 @@ def extract_concept_whitelist(
             temperature=0.0,
         ),
     )
-    return _parse_structured(resp, ConceptWhitelist)
+    wl = _parse_structured(resp, ConceptWhitelist)
+    if book_title.strip():
+        wl.book_title = book_title.strip()
+    if not wl.units:
+        wl.units = [
+            ConceptUnit(
+                unit_name=wl.subject_guess or "지정 개념 범위",
+                page_range=effective_range,
+                core_concepts=list(wl.pdf_concepts),
+                allowed_terms_and_units=list(wl.pdf_vocabulary),
+            )
+        ]
+    return wl
 
 
 def match_questions_to_whitelist(
@@ -528,13 +606,23 @@ def match_questions_to_whitelist(
         "당신은 기출 문항과 개념서 PDF 범위의 정합성을 판정하는 엄격한 심사관입니다.\n"
         "판정 규칙:\n"
         "1. is_solvable_by_pdf_only: 문항의 core_principles와 실제 풀이(official_explanation)가 "
-        "업로드된 PDF의 pdf_concepts 범위(및 초중등 기초 연산·독해)만으로 **100% 완전히 해결 가능**할 때만 True로 판정하세요. "
-        "PDF에 없는 다른 단원의 원리가 하나라도 필요하면 반드시 False로 판정하세요.\n"
+        "업로드된 개념서/공용 DB의 pdf_concepts 범위(및 초중등 기초 연산·독해)만으로 **100% 완전히 해결 가능**할 때만 True로 판정하세요. "
+        "개념서에 없는 다른 단원의 원리가 하나라도 필요하면 반드시 False로 판정하세요.\n"
         "2. out_of_scope_terms: 문항의 required_terms 중 pdf_vocabulary에 없는 상위/범위 외 전문 용어·단위를 적으세요. "
         "(기초 일상어나 '개', '%', '초', 'm', 'g' 등 보편적 기초 단위는 제외 가능하나, 상위 전공 용어나 기호는 반드시 포함)\n"
         "3. needs_rewriting: is_solvable_by_pdf_only가 True이고 out_of_scope_terms가 1개 이상이면 True, "
-        "용어까지 모두 PDF 범위 안이면 False입니다."
+        "용어까지 모두 개념서 범위 안이면 False입니다.\n"
+        "4. matched_unit_name 및 matched_page_range: is_solvable_by_pdf_only가 True인 경우, "
+        "제공된 [개념서 단원별 상세 목록] 중 이 문항의 핵심 원리가 수록된 가장 정확한 단원명(`unit_name`)과 페이지 범위(`page_range`, 예: 'p.184~189')를 그대로 적으세요."
     )
+
+    units_block = ""
+    if whitelist.units:
+        unit_lines = [
+            f"- 단원명: {u.unit_name} | 페이지: {u.page_range} | 핵심 개념: {u.core_concepts[:15]}"
+            for u in whitelist.units
+        ]
+        units_block = "[개념서 단원별 상세 목록]\n" + "\n".join(unit_lines) + "\n\n"
 
     all_judgments: list[QuestionMatchJudgment] = []
     batch_size = 12
@@ -552,9 +640,11 @@ def match_questions_to_whitelist(
             )
 
         prompt = (
-            f"[업로드된 PDF 요약]\n{whitelist.pdf_summary}\n\n"
-            f"[PDF 허용 개념·원리 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
-            f"[PDF 허용 용어 목록 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
+            f"[참고 교재명] {whitelist.book_title or '업로드 개념서 PDF'}\n"
+            f"[개념서 범위 요약]\n{whitelist.pdf_summary}\n\n"
+            f"{units_block}"
+            f"[허용 개념·원리 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
+            f"[허용 용어 목록 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
             "[평가할 기출 문항 목록]\n" + "\n".join(cand_lines)
         )
 
@@ -648,14 +738,15 @@ def generate_pdf_grounded_explanation(
     user_answer: str,
     rewritten: RewrittenQuestion | None = None,
     sliced_text: str = "",
+    concept_reference: str = "",
 ) -> str:
     """모드 B: 문항 이미지 + PDF 범위 + 사용자 오답을 바탕으로 PDF 용어만 사용한 AI 자동 해설을 생성한다."""
     client = _build_client(api_key)
 
     system_inst = (
         "당신은 학생 맞춤형 1:1 AI 튜터입니다.\n"
-        "반드시 **업로드된 개념서 PDF에 있는 개념(pdf_concepts)과 허용 용어(pdf_vocabulary)만** 사용하여 설명하세요. "
-        "PDF 범위를 벗어나는 상위 교육과정 용어(예: 학생이 아직 안 배운 전공 용어)는 절대 사용하지 마세요.\n"
+        "반드시 **선택된 개념서/교과서 범위의 개념(pdf_concepts)과 허용 용어(pdf_vocabulary)만** 사용하여 설명하세요. "
+        "개념서 범위를 벗어나는 상위 교육과정 용어(예: 학생이 아직 안 배운 전공 용어)는 절대 사용하지 마세요.\n"
         "학생이 고른 답과 정답을 비교해 왜 맞았는지 또는 어디서 헷갈렸는지 짚어주고, 단계별 풀이를 친절하고 명료하게 제시하세요."
     )
 
@@ -668,10 +759,12 @@ def generate_pdf_grounded_explanation(
             f"\n[PDF 맞춤 개조 문항]\n{rewritten.rewritten_stem}\n{choices_str}\n"
         )
 
+    ref_line = f"[참고 개념서 단원 및 페이지] {concept_reference}\n" if concept_reference else ""
     prompt = (
         f"[문항 정보] {question.exam_name} {question.q_num}번 ({question.curriculum_subject})\n"
         f"[정답] {question.answer}\n"
         f"[학생이 입력한 답] {user_answer or '(미입력)'}\n"
+        f"{ref_line}"
         f"{rewritten_block}\n"
         f"[공식 해설 참고] {question.official_explanation}\n\n"
         f"[반드시 이 범위 내 개념·용어만 사용]\n"
@@ -696,7 +789,10 @@ def generate_pdf_grounded_explanation(
         ),
         fast_mode=True,
     )
-    return (resp.text or "").strip()
+    out_md = (resp.text or "").strip()
+    if concept_reference and concept_reference not in out_md:
+        out_md = f"{out_md}\n\n---\n**{concept_reference}**"
+    return out_md
 
 
 def chat_followup_with_pdf(

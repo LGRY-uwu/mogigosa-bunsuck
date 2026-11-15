@@ -224,6 +224,12 @@ def generate_custom_exam_pdf(
         q: QuestionRecord = item["question"]
         crop_bytes: bytes | None = item.get("crop_png_bytes")
         rewritten: RewrittenQuestion | None = item.get("rewritten")
+        concept_ref: str = str(item.get("concept_reference") or "").strip()
+        ref_html = (
+            f"<div class='ref-note' style='color:#1E40AF; font-weight:bold; margin-top:4pt;'>{html.escape(concept_ref)}</div>"
+            if concept_ref
+            else ""
+        )
 
         col_x0, col_x1, _ = col_rects[col_idx]
         col_w = col_x1 - col_x0
@@ -249,6 +255,7 @@ def generate_custom_exam_pdf(
               </div>
               <div class="stem">{_esc_nl(rewritten.rewritten_stem)}</div>
               {choices_html}
+              {ref_html}
             </div>
             """
             text_h = _measure_html_height(card_html, col_w, max_h=720.0)
@@ -305,6 +312,7 @@ def generate_custom_exam_pdf(
             <div class="q-header">
               <span class="q-num">{idx}.</span>
               <span class="meta">[{html.escape(q.curriculum_subject)} · {html.escape(q.unit_name)}] (원본 {html.escape(q.exam_name)} {q.q_num}번)</span>
+              {ref_html}
             </div>
             """
             header_h = _measure_html_height(header_html, col_w, max_h=80.0)
@@ -393,6 +401,12 @@ def generate_custom_exam_pdf(
     for idx, item in enumerate(items, start=1):
         q = item["question"]
         rewritten = item.get("rewritten")
+        concept_ref = str(item.get("concept_reference") or "").strip()
+        exp_ref_html = (
+            f"<div style='margin-top:4pt; font-size:8.2pt; color:#1E40AF; font-weight:bold;'>{html.escape(concept_ref)}</div>"
+            if concept_ref
+            else ""
+        )
 
         if rewritten is not None:
             ans_disp = _format_answer_badge(rewritten.preserved_answer)
@@ -423,6 +437,7 @@ def generate_custom_exam_pdf(
           </div>
           {swap_info}
           <div>{exp_body}</div>
+          {exp_ref_html}
         </div>
         """
         eh = _measure_html_height(exp_html, page_w - 64.0, max_h=720.0)
