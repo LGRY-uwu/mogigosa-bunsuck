@@ -57,6 +57,7 @@ from src.gemini_service import (
     chat_followup_with_pdf,
     detect_concept_pages_with_ai,
     detect_scanned_question_boxes,
+    extract_concept_book_cover_metadata,
     extract_concept_book_units,
     extract_concept_whitelist,
     extract_exam_header_metadata,
@@ -644,6 +645,56 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
 
     with st.container(border=True):
         st.markdown("#### ➕ 새 개념서·교과서 PDF 업로드 및 개념 구간 추출")
+        cb_pdf_file = st.file_uploader(
+            "교재 / 개념서 PDF 파일 업로드 (올리는 즉시 표지 자동 인식)",
+            type=["pdf"],
+            key=f"{key_prefix}_pdf_uploader",
+        )
+        cb_pdf_bytes: bytes | None = cb_pdf_file.getvalue() if cb_pdf_file is not None else None
+        cb_sig = f"{cb_pdf_file.name}:{cb_pdf_file.size}" if cb_pdf_file is not None else ""
+
+        if not cb_sig:
+            st.session_state[f"{key_prefix}_last_cb_sig"] = ""
+            st.session_state[f"{key_prefix}_cb_meta_status"] = ""
+        elif cb_sig != st.session_state.get(f"{key_prefix}_last_cb_sig"):
+            auto_title = cb_pdf_file.name.rsplit(".", 1)[0].replace("_", " ").strip()
+            auto_subj_grade = ""
+            if cb_pdf_bytes and active_gemini_key:
+                try:
+                    with st.spinner("🔍 개념서 표지(교재명 · 과목 및 학년) 자동 인식 중..."):
+                        p1_txt, p1_png = extract_first_page_for_metadata(cb_pdf_bytes, dpi=140)
+                        if p1_png is None:
+                            p1_png = render_pdf_page_png(cb_pdf_bytes, 1, dpi=140)
+                        cover_meta = extract_concept_book_cover_metadata(
+                            api_key=active_gemini_key,
+                            model_name=EXAM_TAGGING_MODEL,
+                            first_page_text=p1_txt,
+                            first_page_png_bytes=p1_png,
+                            filename=cb_pdf_file.name,
+                        )
+                        if cover_meta.book_title:
+                            auto_title = cover_meta.book_title
+                        if cover_meta.subject_and_grade:
+                            auto_subj_grade = cover_meta.subject_and_grade
+                except Exception:
+                    pass
+            st.session_state[f"{key_prefix}_book_title"] = auto_title
+            st.session_state[f"{key_prefix}_subject_grade"] = auto_subj_grade
+            st.session_state[f"{key_prefix}_last_cb_sig"] = cb_sig
+            st.session_state[f"{key_prefix}_cb_meta_status"] = (
+                "parsed" if (auto_title and auto_subj_grade) else "partial"
+            )
+
+        if cb_sig:
+            cb_meta_st = st.session_state.get(f"{key_prefix}_cb_meta_status", "")
+            if cb_meta_st == "parsed":
+                st.success(
+                    f"🎯 표지 자동 인식 완료: **{st.session_state.get(f'{key_prefix}_book_title', '')}** "
+                    f"({st.session_state.get(f'{key_prefix}_subject_grade', '')}) — 필요 시 아래에서 수정하세요"
+                )
+            elif cb_meta_st == "partial":
+                st.info("📄 파일명/표지 일부를 채웠습니다. 빈칸이나 수정이 필요한 부분을 확인해 주세요.")
+
         cb_col1, cb_col2 = st.columns(2)
         with cb_col1:
             book_title_in = st.text_input(
@@ -679,17 +730,10 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
         else:
             st.info(
                 "🤖 **AI 자동 추출 모드**: 페이지 범위를 직접 입력하지 않아도 "
-                "사이드바에서 선택된 Gemini AI 모델이 PDF 전체를 스캔해 **표지·목차·문제 풀이·정답지를 제외하고 "
-                "순수 개념 설명 구간만 자동 판별**한 뒤 단원별로 구조화합니다."
+                "Gemini 3.8 Flash가 먼저 목차를 분석한 뒤 본문과 대조해 **표지·목차·문제 풀이·정답지를 제외하고 "
+                "순수 개념 설명 구간만 빠짐없이 판별**하여 단원별로 구조화합니다."
             )
 
-        cb_pdf_file = st.file_uploader(
-            "교재 / 개념서 PDF 파일 업로드",
-            type=["pdf"],
-            key=f"{key_prefix}_pdf_uploader",
-        )
-
-        cb_pdf_bytes: bytes | None = cb_pdf_file.getvalue() if cb_pdf_file is not None else None
         parsed_intervals: list[tuple[int, int]] = []
         if cb_pdf_bytes is not None:
             total_cb_pages = get_pdf_page_count(cb_pdf_bytes)

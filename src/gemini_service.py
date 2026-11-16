@@ -18,6 +18,7 @@ from src.models import (
     BatchExamExtractionOutput,
     BatchMatchResult,
     BatchQuestionTagItem,
+    ConceptBookCoverMetadata,
     ConceptBookExtractionOutput,
     ConceptUnit,
     ConceptWhitelist,
@@ -1361,4 +1362,55 @@ def extract_exam_header_metadata(
         grade=grade,
         subject=subject,
         exam_title=standardized_title,
+    )
+
+
+def extract_concept_book_cover_metadata(
+    api_key: str,
+    model_name: str,
+    first_page_text: str,
+    first_page_png_bytes: bytes | None = None,
+    filename: str = "",
+) -> ConceptBookCoverMetadata:
+    """
+    개념서·교과서 PDF 1페이지(표지) 이미지와 텍스트·파일명을 분석해
+    교재명(book_title)과 과목 및 학년(subject_and_grade)을 자동 추출한다.
+    """
+    client = _build_client(api_key, timeout_seconds=20)
+    system_inst = (
+        "당신은 한국 고등학교 교과서·개념서(완자, 개념원리, 마플, 수능특강, 자이스토리 등) 표지 판독기입니다.\n"
+        "첨부된 표지(1페이지) 이미지, 텍스트, 파일명을 종합하여 다음 2개 필드를 정확히 추출하세요:\n"
+        "1) book_title: 교재명 또는 출판사+교과서명 (예: '완자 통합과학', '개념원리 공통수학1', '비상 통합사회1')\n"
+        "2) subject_and_grade: 학년과 과목명 (예: '고1 통합과학', '고1 공통수학1', '고2 물리학Ⅰ', '고3 화학Ⅱ')"
+    )
+    text_excerpt = (first_page_text or "").strip()[:2500]
+    fn_hint = f"[업로드 파일명]\n{filename.strip()}\n\n" if filename and filename.strip() else ""
+    prompt = (
+        f"{fn_hint}"
+        "[표지/1페이지 텍스트 발췌]\n"
+        f"{text_excerpt if text_excerpt else '(텍스트가 거의 없는 스캔 표지입니다. 첨부된 표지 이미지를 확인하세요.)'}\n\n"
+        "위 개념서·교과서의 교재명(book_title)과 과목 및 학년(subject_and_grade)을 JSON으로 반환하세요."
+    )
+    contents: list[Any] = []
+    if first_page_png_bytes:
+        opt_png = optimize_image_for_vision(first_page_png_bytes, max_width=1200)
+        contents.append(types.Part.from_bytes(data=opt_png, mime_type="image/png"))
+    contents.append(prompt)
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=ConceptBookCoverMetadata,
+            temperature=0.0,
+        ),
+        fast_mode=True,
+    )
+    meta = _parse_structured(resp, ConceptBookCoverMetadata)
+    return ConceptBookCoverMetadata(
+        book_title=meta.book_title.strip(),
+        subject_and_grade=meta.subject_and_grade.strip(),
     )

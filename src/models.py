@@ -281,6 +281,13 @@ class ExamHeaderMetadata(BaseModel):
     )
 
 
+class ConceptBookCoverMetadata(BaseModel):
+    """개념서·교과서 PDF 표지/앞부분에서 자동 추출한 교재명·과목 및 학년."""
+
+    book_title: str = Field(..., description="교재명 또는 교과서명 (예: '완자 통합과학', '개념원리 공통수학1', '비상 통합과학1')")
+    subject_and_grade: str = Field(..., description="과목 및 학년 (예: '고1 통합과학', '고2 물리학Ⅰ', '고1 공통수학1')")
+
+
 def infer_subject_category(subject: str) -> SubjectCategory:
     """세부 과목명을 대분류('수학' | '사회' | '과학')로 매핑한다."""
     s = (subject or "").strip()
