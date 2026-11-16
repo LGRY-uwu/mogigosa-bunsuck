@@ -14,7 +14,9 @@ from src.config import DEFAULT_MODEL, HYDROGEN_MODEL, resolve_api_model_name
 from src.models import (
     AutoConceptPageDetectionOutput,
     AutoConceptRangeItem,
+    BatchExamExtractionOutput,
     BatchMatchResult,
+    BatchQuestionTagItem,
     ConceptBookExtractionOutput,
     ConceptUnit,
     ConceptWhitelist,
@@ -473,6 +475,99 @@ def analyze_question_with_gemini(
     if status_callback is not None:
         status_callback(f"{q_num}번 응답 파싱 중...")
     return _parse_structured(resp, QuestionExtractionOutput)
+
+
+def analyze_exam_pdf_batch_with_gemini(
+    api_key: str,
+    model_name: str,
+    prob_pdf_bytes: bytes,
+    target_q_nums: list[int],
+    subject_category: str,
+    exam_name: str,
+    answer_snippets: dict[int, str] | None = None,
+    answer_pdf_part: Any | None = None,
+    status_callback: Callable[[str], None] | None = None,
+) -> dict[int, BatchQuestionTagItem]:
+    """
+    전체 모의고사 문제지 PDF(및 해설지)를 한 번에 Gemini에 전달해
+    요청된 전체 문항 번호(target_q_nums)의 원리·용어·정답·해설을 일괄 태깅한다.
+    """
+    ordered_q = sorted({int(q) for q in target_q_nums})
+    if not ordered_q:
+        return {}
+
+    client = _build_client(api_key, timeout_seconds=120)
+    if status_callback is not None:
+        status_callback(f"📄 전체 모의고사 PDF({len(ordered_q)}문항) 일괄 분석 준비 중...")
+
+    prob_part = prepare_pdf_part(
+        client,
+        prob_pdf_bytes,
+        display_name=f"{exam_name}_problem.pdf",
+    )
+
+    system_inst = (
+        "당신은 대한민국 2022 개정 교육과정(수학·사회·과학) 전문 기출 문항 분석가입니다. "
+        "첨부된 전체 모의고사 문제지 PDF에서 요청된 모든 문항 번호를 빠짐없이 찾아, "
+        "각 문항마다 '본질적 풀이 원리(core_principles)'와 '표면적 전문 용어·단위(required_terms)'를 "
+        "명확히 분리하여 JSON 배열(questions)로 한 번에 반환하세요.\n"
+        "- q_num: 문항 번호 정수 (요청된 문항 번호를 1개도 누락하지 마세요)\n"
+        "- core_principles: 상위 과목의 포장된 용어를 걷어내고 문제를 실제로 풀기 위해 필요한 근본적 원리/법칙을 간결한 한국어 개념구로 나열\n"
+        "- required_terms: 실제 문제 지문, 그림, 표, 보기에 등장하는 전문 용어·기호·단위 목록\n"
+        "- min_grade: core_principles를 2022 개정 교육과정에서 처음 배우는 최저 학년 (반드시 1, 2, 3 정수: 1=고1, 2=고2, 3=고3)\n"
+        "- answer: 해설지 참고 내용이나 첨부된 해설지 PDF의 공식 정답 (객관식은 '1'~'5' 숫자 문자열만, 주관식은 값만)\n"
+        "- official_explanation: 핵심 풀이 요약 (1~2문장으로 간결하게 작성해 전체 문항이 응답 토큰 안에 모두 들어가도록 하세요)"
+    )
+
+    snippets_map = answer_snippets or {}
+    snippet_lines: list[str] = []
+    for q in ordered_q:
+        sn = (snippets_map.get(q) or "").strip()
+        if sn:
+            snippet_lines.append(f"[{q}번 해설 발췌] {sn[:500]}")
+
+    hint_section = (
+        "\n[해설지 문항별 발췌]\n" + "\n".join(snippet_lines) + "\n"
+        if snippet_lines
+        else ""
+    )
+    q_list_str = ", ".join(str(q) for q in ordered_q)
+    prompt = (
+        f"시험 회차: {exam_name}\n"
+        f"대분류 과목: {subject_category}\n"
+        f"태깅 대상 문항 번호(총 {len(ordered_q)}문항): {q_list_str}\n"
+        f"{hint_section}\n"
+        "위 문제지 PDF 전체에서 지정된 모든 문항 번호를 한 번에 분석해 JSON 스키마(questions)로 반환하세요."
+    )
+
+    contents: list[Any] = [prob_part]
+    if answer_pdf_part is not None and not snippet_lines:
+        contents.append(answer_pdf_part)
+    contents.append(prompt)
+
+    if status_callback is not None:
+        status_callback(f"⚡ {model_name} 모델로 전체 PDF({len(ordered_q)}문항) 한 번에 태깅 중...")
+
+    resp = _generate_content_with_fallback(
+        client=client,
+        model_name=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system_inst,
+            response_mime_type="application/json",
+            response_schema=BatchExamExtractionOutput,
+            temperature=0.1,
+            max_output_tokens=32768,
+        ),
+        fast_mode=True,
+        status_callback=status_callback,
+    )
+    parsed = _parse_structured(resp, BatchExamExtractionOutput)
+    out: dict[int, BatchQuestionTagItem] = {}
+    for item in parsed.questions:
+        if item.q_num in ordered_q and item.q_num not in out:
+            out[item.q_num] = item
+    return out
 
 
 def detect_concept_pages_with_ai(

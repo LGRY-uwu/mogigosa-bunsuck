@@ -30,10 +30,11 @@ from src.auth import (
     save_user_custom_api_key,
     verify_session_token,
 )
-from src.config import AVAILABLE_MODELS, DEFAULT_MODEL, MODEL_LABELS, resolve_credentials
+from src.config import AVAILABLE_MODELS, DEFAULT_MODEL, EXAM_TAGGING_MODEL, MODEL_LABELS, resolve_credentials
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_html, build_exam_markdown
 from src.gemini_service import (
+    analyze_exam_pdf_batch_with_gemini,
     analyze_question_with_gemini,
     build_gemini_client,
     chat_followup_with_pdf,
@@ -1093,14 +1094,14 @@ with tab1:
                         if target_vision_pages:
                             st.info(
                                 f"텍스트가 부족한 {len(target_vision_pages)}개 페이지를 "
-                                "Gemini Vision으로 1페이지씩 순차 탐지합니다..."
+                                f"{MODEL_LABELS.get(EXAM_TAGGING_MODEL, EXAM_TAGGING_MODEL)} Vision으로 1페이지씩 순차 탐지합니다..."
                             )
                             existing_by_q: dict[int, CroppedQuestion] = {c.q_num: c for c in crops}
                             prog = st.progress(0.0)
                             for step_i, p_num in enumerate(target_vision_pages, start=1):
                                 page_png = render_pdf_page_png(active_prob_bytes, p_num, dpi=180)
                                 boxes = detect_scanned_question_boxes(
-                                    active_gemini_key, selected_model, page_png
+                                    active_gemini_key, EXAM_TAGGING_MODEL, page_png
                                 )
                                 # 왼쪽 단(xmin < 500) 위->아래, 오른쪽 단(xmin >= 500) 위->아래 순 정렬
                                 boxes.sort(key=lambda b: (0 if b.xmin < 500 else 1, b.ymin, b.xmin))
@@ -1210,9 +1211,11 @@ with tab1:
                 return
 
             safe_exam = sanitize_id_part(meta["exam_name"])
+            tagging_model = EXAM_TAGGING_MODEL
+            tagging_model_label = MODEL_LABELS.get(tagging_model, tagging_model)
             sync_notice = st.warning(
                 "☁️ **\"Google Drive 동기화 완료\"** 문구가 뜰 때까지 브라우저 창을 닫지 말고 유지해 주세요. "
-                "(매 문항은 서버 로컬 `./exam_db`에 즉시 저장되고, 5문항마다 중간 백업 + 완료 직후 일괄 동기화됩니다.)"
+                "(전체 PDF를 한 번에 태깅한 뒤 로컬 DB와 Google Drive에 일괄 저장합니다.)"
             )
             status_placeholder = st.empty()
             log_placeholder = st.empty()
@@ -1225,8 +1228,8 @@ with tab1:
                 live_logs.append(line)
                 log_placeholder.code("\n".join(live_logs[-15:]), language="text")
 
-            mode_label = "실패 문항 재분석" if is_retry else "전체 문항 분석"
-            _push_status(f"🔑 API 키 검증 완료 ({verified_key_label}) · {mode_label} 준비 중...")
+            mode_label = "누락/실패 문항 재분석" if is_retry else "전체 PDF 일괄 태깅"
+            _push_status(f"🔑 API 키 검증 완료 ({verified_key_label}) · {mode_label} 준비 중 (모델: {tagging_model_label})...")
             pending_pdf_files: list[str] = []
             pending_crop_files: list[str] = []
             if not is_retry:
@@ -1280,124 +1283,133 @@ with tab1:
             existing_records = storage.load_db()
             rec_map = {r.id: r for r in existing_records}
 
-            prog_bar = st.progress(0.0)
+            prog_bar = st.progress(0.05)
             newly_saved: list[QuestionRecord] = []
             failed_q_nums: list[int] = []
             errors: list[str] = []
 
-            max_workers = 4
             batch_t0 = time.perf_counter()
-            _push_status(
-                f"⚡ 최대 {min(max_workers, max(1, len(target_crops)))}문항 동시 병렬 분석 시작 "
-                f"(총 {len(target_crops)}문항 · 모델: {MODEL_LABELS.get(selected_model, selected_model)})..."
-            )
+            extracted_by_q: dict[int, Any] = {}
 
-            def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
-                t_start = time.perf_counter()
-                extracted_out = analyze_question_with_gemini(
-                    api_key=verified_key,
-                    model_name=selected_model,
-                    crop_png_bytes=cq_item.png_bytes,
-                    q_num=cq_item.q_num,
+            # 1) 전체 문제지 PDF를 Gemini 3.5 Flash-Lite로 한 번에 일괄 태깅
+            if meta.get("prob_bytes"):
+                _push_status(
+                    f"⚡ 전체 문제지 PDF({len(target_crops)}문항) 한 번에 태깅 중 "
+                    f"(모델: {tagging_model_label})..."
+                )
+                try:
+                    batch_map = analyze_exam_pdf_batch_with_gemini(
+                        api_key=verified_key,
+                        model_name=tagging_model,
+                        prob_pdf_bytes=meta["prob_bytes"],
+                        target_q_nums=[c.q_num for c in target_crops],
+                        subject_category=meta["subject_category"],
+                        exam_name=meta["exam_name"],
+                        answer_snippets=answer_snippets,
+                        answer_pdf_part=answer_pdf_part,
+                        status_callback=_push_status,
+                    )
+                    extracted_by_q.update(batch_map)
+                    _append_log(
+                        f"⚡ 전체 PDF 일괄 태깅 완료: {len(batch_map)}/{len(target_crops)}문항 "
+                        f"({time.perf_counter() - batch_t0:.1f}초 · {tagging_model_label})"
+                    )
+                except Exception as exc:
+                    _append_log(f"⚠️ 전체 PDF 일괄 태깅 실패 → 개별 보완 모드로 전환: {exc}")
+
+            prog_bar.progress(0.65)
+
+            # 2) 일괄 태깅에서 누락된 문항(또는 prob_bytes가 없는 경우)만 개별 보완
+            missing_crops = [c for c in target_crops if c.q_num not in extracted_by_q]
+            if missing_crops:
+                _push_status(
+                    f"🔁 누락된 {len(missing_crops)}개 문항 보완 태깅 중 ({tagging_model_label})..."
+                )
+
+                def _analyze_worker(cq_item: CroppedQuestion) -> tuple[CroppedQuestion, Any, float]:
+                    t_start = time.perf_counter()
+                    extracted_out = analyze_question_with_gemini(
+                        api_key=verified_key,
+                        model_name=tagging_model,
+                        crop_png_bytes=cq_item.png_bytes,
+                        q_num=cq_item.q_num,
+                        subject_category=meta["subject_category"],
+                        exam_name=meta["exam_name"],
+                        answer_pdf_part=answer_pdf_part,
+                        answer_text_hint=answer_snippets.get(cq_item.q_num, ""),
+                        status_callback=None,
+                    )
+                    return cq_item, extracted_out, time.perf_counter() - t_start
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    future_to_cq = {executor.submit(_analyze_worker, cq): cq for cq in missing_crops}
+                    for fut in concurrent.futures.as_completed(future_to_cq):
+                        cq = future_to_cq[fut]
+                        try:
+                            _, extracted, elapsed_s = fut.result()
+                            extracted_by_q[cq.q_num] = extracted
+                            _append_log(f"✅ {cq.q_num}번 보완 태깅 완료 ({elapsed_s:.1f}초)")
+                        except Exception as exc:
+                            err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
+                            failed_q_nums.append(cq.q_num)
+                            errors.append(err_msg)
+                            _append_log(f"❌ {err_msg}")
+
+            prog_bar.progress(0.85)
+
+            # 3) 모든 문항 크롭 이미지 및 DB 레코드를 한 번에 로컬 저장 후 일괄 동기화
+            _push_status("💾 전체 문항 크롭 이미지 및 DB 한 번에 저장 중...")
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            for cq in target_crops:
+                extracted = extracted_by_q.get(cq.q_num)
+                if extracted is None:
+                    continue
+                q_id = f"{safe_exam}__Q{cq.q_num:02d}"
+                img_filename = f"{q_id}.png"
+                storage.save_crop_png(
+                    img_filename,
+                    cq.png_bytes,
                     subject_category=meta["subject_category"],
                     exam_name=meta["exam_name"],
-                    answer_pdf_part=answer_pdf_part,
-                    answer_text_hint=answer_snippets.get(cq_item.q_num, ""),
-                    status_callback=None,
+                    sync_drive=False,
                 )
-                return cq_item, extracted_out, time.perf_counter() - t_start
+                pending_crop_files.append(img_filename)
 
-            done_count = 0
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_cq = {
-                    executor.submit(_analyze_worker, cq): cq for cq in target_crops
-                }
-                for fut in concurrent.futures.as_completed(future_to_cq):
-                    cq = future_to_cq[fut]
-                    done_count += 1
-                    prefix = f"[{done_count}/{len(target_crops)} · {cq.q_num}번]"
-                    try:
-                        _, extracted, elapsed_s = fut.result()
-                        q_id = f"{safe_exam}__Q{cq.q_num:02d}"
-                        img_filename = f"{q_id}.png"
-                        storage.save_crop_png(
-                            img_filename,
-                            cq.png_bytes,
-                            subject_category=meta["subject_category"],
-                            exam_name=meta["exam_name"],
-                            sync_drive=False,
-                        )
-                        pending_crop_files.append(img_filename)
+                record = QuestionRecord(
+                    id=q_id,
+                    exam_name=meta["exam_name"],
+                    q_num=cq.q_num,
+                    subject_category=meta["subject_category"],
+                    curriculum_subject=extracted.curriculum_subject,
+                    unit_name=extracted.unit_name,
+                    min_grade=extracted.min_grade,
+                    core_principles=extracted.core_principles,
+                    required_terms=extracted.required_terms,
+                    is_single_concept=extracted.is_single_concept,
+                    answer=extracted.answer,
+                    official_explanation=extracted.official_explanation,
+                    image_filename=img_filename,
+                    source_pdf=f"{safe_exam}__문제지.pdf",
+                    answer_pdf=f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "",
+                    created_at=now_iso,
+                )
+                rec_map[q_id] = record
+                newly_saved.append(record)
 
-                        record = QuestionRecord(
-                            id=q_id,
-                            exam_name=meta["exam_name"],
-                            q_num=cq.q_num,
-                            subject_category=meta["subject_category"],
-                            curriculum_subject=extracted.curriculum_subject,
-                            unit_name=extracted.unit_name,
-                            min_grade=extracted.min_grade,
-                            core_principles=extracted.core_principles,
-                            required_terms=extracted.required_terms,
-                            is_single_concept=extracted.is_single_concept,
-                            answer=extracted.answer,
-                            official_explanation=extracted.official_explanation,
-                            image_filename=img_filename,
-                            source_pdf=f"{safe_exam}__문제지.pdf",
-                            answer_pdf=f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "",
-                            created_at=datetime.now().isoformat(timespec="seconds"),
-                        )
-                        rec_map[q_id] = record
-                        newly_saved.append(record)
-
-                        # 매 완료 문항 로컬 즉시 체크포인트 (Drive 호출 없음)
-                        storage.save_db(
-                            list(rec_map.values()),
-                            sync_organized_drive=False,
-                            sync_db_drive=False,
-                            sync_local_organized=False,
-                        )
-                        _push_status(f"{prefix} ✅ 분석 완료 ({elapsed_s:.1f}초) · 병렬 진행 중...")
-                        _append_log(
-                            f"✅ {cq.q_num}번 완료 ({elapsed_s:.1f}초) · {record.curriculum_subject} / {record.unit_name} / 정답 {record.answer}"
-                        )
-
-                        # 5문항 완료마다 Google Drive 중간 백업 동기화 1회 실행
-                        if len(newly_saved) % 5 == 0 and done_count < len(target_crops):
-                            _push_status(
-                                f"☁️ 중간 백업 동기화 중 ({len(newly_saved)}문항 완료) · "
-                                "'Google Drive 동기화 완료'가 뜰 때까지 창을 유지해 주세요..."
-                            )
-                            mid_err = storage.sync_exam_batch(
-                                subject_category=meta["subject_category"],
-                                exam_name=meta["exam_name"],
-                                records=sorted(rec_map.values(), key=lambda r: (r.exam_name, r.q_num)),
-                                crop_filenames=pending_crop_files,
-                                pdf_filenames=pending_pdf_files,
-                                include_organized_exports=False,
-                            )
-                            if mid_err:
-                                _append_log(f"⚠️ 중간 백업 경고: {mid_err}")
-                            else:
-                                pending_crop_files.clear()
-                                pending_pdf_files.clear()
-                                _append_log(f"☁️ 5문항 중간 백업 동기화 완료 (누적 {len(newly_saved)}문항)")
-                    except Exception as exc:
-                        err_msg = f"{cq.q_num}번 오류 (건너뜀): {exc}"
-                        failed_q_nums.append(cq.q_num)
-                        errors.append(err_msg)
-                        _push_status(f"{prefix} ❌ 실패 → 다른 병렬 문항 진행 중 ({exc})")
-                        _append_log(f"❌ {err_msg}")
-
-                    prog_bar.progress(done_count / len(target_crops))
-
-            # 모든 병렬 작업 완료 후 문항 번호순(1번~끝번) 정렬 및 로컬·Drive 최종 일괄 동기화
             newly_saved.sort(key=lambda r: r.q_num)
             sorted_all_records = sorted(rec_map.values(), key=lambda r: (r.exam_name, r.q_num))
             pending_crop_files.sort()
 
+            # 로컬 db.json 1회 일괄 저장
+            storage.save_db(
+                sorted_all_records,
+                sync_organized_drive=False,
+                sync_db_drive=False,
+                sync_local_organized=False,
+            )
+
             _push_status(
-                "☁️ 문항 번호순 정렬 및 Google Drive 최종 일괄 동기화 중... "
+                "☁️ 전체 문항 로컬 저장 및 Google Drive 일괄 동기화 중... "
                 "('Google Drive 동기화 완료'가 뜰 때까지 창을 유지해 주세요)"
             )
             sync_err = storage.sync_exam_batch(
@@ -1408,8 +1420,9 @@ with tab1:
                 pdf_filenames=pending_pdf_files,
                 include_organized_exports=True,
             )
+            prog_bar.progress(1.0)
             total_batch_s = time.perf_counter() - batch_t0
-            _append_log(f"🏁 전체 병렬 분석 및 일괄 동기화 완료 (총 {total_batch_s:.1f}초)")
+            _append_log(f"🏁 전체 PDF 태깅 및 일괄 저장·동기화 완료 ({len(newly_saved)}문항 · 총 {total_batch_s:.1f}초)")
             sync_notice.empty()
             status_placeholder.empty()
 

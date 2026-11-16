@@ -86,6 +86,21 @@ class QuestionExtractionOutput(BaseModel):
     official_explanation: str = Field(..., description="공식 해설의 핵심 풀이 요약")
 
 
+class BatchQuestionTagItem(QuestionExtractionOutput):
+    """전체 모의고사 PDF 일괄 태깅 시 각 문항 번호가 포함된 구조화 메타데이터."""
+
+    q_num: int = Field(..., ge=1, description="문항 번호 (1-based)")
+
+
+class BatchExamExtractionOutput(BaseModel):
+    """전체 모의고사 PDF를 한 번에 태깅해 반환하는 문항 목록 스키마."""
+
+    questions: list[BatchQuestionTagItem] = Field(
+        default_factory=list,
+        description="요청된 전체 문항 번호별 원리·용어·정답·해설 태깅 결과 목록",
+    )
+
+
 class ConceptUnit(BaseModel):
     """단원별 개념 요약·허용 용어 및 실제 페이지 번호 스키마."""
 

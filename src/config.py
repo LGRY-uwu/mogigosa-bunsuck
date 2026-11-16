@@ -24,6 +24,7 @@ MODEL_LABELS: dict[str, str] = {
     "gemini-3.8-flash": "Gemini 3.8 Flash",
 }
 DEFAULT_MODEL: str = "gemini-3.5-flash"
+EXAM_TAGGING_MODEL: str = "gemini-3.5-flash-lite"
 
 
 def resolve_api_model_name(model_choice: str | None) -> str:
