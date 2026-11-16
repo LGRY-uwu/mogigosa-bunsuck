@@ -25,6 +25,7 @@ from src.auth import (
     consume_extraction_quota,
     consume_premium_model_usage,
     create_session_token,
+    delete_users_by_usernames,
     get_remaining_free_quota,
     get_remaining_pro_weekly_quota,
     get_user_by_username,
@@ -49,6 +50,7 @@ from src.gemini_service import (
     detect_scanned_question_boxes,
     extract_concept_book_units,
     extract_concept_whitelist,
+    extract_exam_header_metadata,
     generate_pdf_grounded_explanation,
     match_questions_to_whitelist,
     prepare_pdf_part,
@@ -71,6 +73,7 @@ from src.pdf_parser import (
     extract_answer_snippets_from_pdf,
     extract_concept_pages_by_ranges,
     extract_exam_metadata_fast,
+    extract_first_page_preview,
     extract_pdf_page_catalog,
     extract_pdf_slice,
     get_page_text_lengths,
@@ -392,23 +395,13 @@ with st.sidebar:
             st.rerun()
 
         st.markdown("---")
-        default_idx = (
-            AVAILABLE_MODELS.index("gemini-3.5-flash-lite")
-            if tier_code == "FREE" and "gemini-3.5-flash-lite" in AVAILABLE_MODELS
-            else AVAILABLE_MODELS.index(DEFAULT_MODEL)
-        )
-        requested_model = st.selectbox(
-            "🤖 Gemini 모델 선택",
-            options=AVAILABLE_MODELS,
-            index=default_idx,
-            format_func=lambda m: MODEL_LABELS.get(m, m),
-            help="FREE 등급은 기본 3.5 Flash-Lite로 실행되며, 기출 3회 업로드당 고급 모델(3.8/Hydrogen) 1회가 해금됩니다.",
-        )
-        selected_model, model_notice = resolve_model_for_user(current_user, requested_model)
-        if model_notice:
-            st.caption(f"ℹ️ {model_notice}")
-        elif tier_code == "FREE" and is_premium_model(selected_model):
-            st.caption(f"🔓 해금 크레딧 1회 사용 예정 (보유: {int(getattr(current_user, 'premium_unlock_credits', 0) or 0)}회)")
+        # 등급별 최적 모델 자동 배정 (사이드바 모델 선택 UI 제거)
+        if tier_code == "FREE":
+            selected_model = "gemini-3.5-flash-lite"
+        elif tier_code == "PRO":
+            selected_model, _ = resolve_model_for_user(current_user, "gemini-3.8-flash")
+        else:
+            selected_model = "gemini-3.8-flash"
 
         # 저장소 & DB 요약
         all_records = storage.load_db()
@@ -539,6 +532,47 @@ def _render_admin_panel() -> None:
             st.rerun()
         else:
             st.info("변경된 등급이 없습니다.")
+
+    with st.expander("🗑️ 관리자: 회원 계정 삭제", expanded=False):
+        actor_id = current_user.username if current_user is not None else ""
+        deletable_users = [u for u in filtered_users if u.username != actor_id]
+        if not deletable_users:
+            st.info("삭제 가능한 다른 회원 계정이 없습니다.")
+        else:
+            del_options = [u.username for u in deletable_users]
+            user_label_map = {
+                u.username: f"@{u.username} ({u.nickname} · {u.tier})"
+                for u in deletable_users
+            }
+            del_targets = st.multiselect(
+                "삭제할 회원 계정 선택 (본인 계정 및 마지막 관리자는 보호됨)",
+                options=del_options,
+                format_func=lambda un: user_label_map.get(un, un),
+                key="admin_delete_user_select",
+            )
+            confirm_del_users = st.checkbox(
+                "선택한 회원 계정을 영구 삭제합니다. (복구 불가)",
+                key="admin_confirm_delete_users",
+            )
+            if st.button(
+                "🗑️ 선택한 계정 영구 삭제",
+                disabled=not (del_targets and confirm_del_users),
+                key="admin_exec_delete_users",
+            ):
+                del_cnt, del_err, del_note = delete_users_by_usernames(
+                    storage,
+                    del_targets,
+                    actor_username=actor_id,
+                )
+                if del_err:
+                    st.warning(f"{del_cnt}개 계정 삭제됨 / Drive 저장 경고: {del_err}")
+                elif del_cnt > 0:
+                    st.success(f"🗑️ {del_cnt}개 회원 계정을 영구 삭제했습니다.")
+                    if del_note:
+                        st.info(del_note)
+                    st.rerun()
+                elif del_note:
+                    st.warning(del_note)
 
 
 if current_user is None:
@@ -1040,7 +1074,9 @@ with tab1:
                 "exam_title": "",
             }
             has_p1_text = False
+            ai_verified = False
             if active_prob_bytes:
+                # 1차: 기존 PyMuPDF 텍스트 정규식 즉시 파싱
                 try:
                     parsed_local, has_p1_text = extract_exam_metadata_fast(
                         active_prob_bytes,
@@ -1056,6 +1092,45 @@ with tab1:
                     }
                     has_p1_text = False
 
+                # 2차: 다른 방식(1페이지 이미지 + Gemini 3.5 Flash-Lite Vision)으로 빠르게 한 번 더 교차 판독
+                if active_gemini_key:
+                    try:
+                        with st.spinner("🔍 1차 텍스트 파싱 + 2차 AI 비전 표지 교차 검증 중..."):
+                            p1_text, p1_png, _ = extract_first_page_preview(active_prob_bytes, dpi=140)
+                            if p1_png is None:
+                                p1_png = render_pdf_page_png(active_prob_bytes, 1, dpi=140)
+                            ai_meta = extract_exam_header_metadata(
+                                api_key=active_gemini_key,
+                                model_name=EXAM_TAGGING_MODEL,
+                                first_page_text=p1_text,
+                                first_page_png_bytes=p1_png,
+                                filename=active_prob_name,
+                            )
+                            merged_year = (ai_meta.year or parsed_local.get("year") or "").strip().rstrip("년")
+                            merged_month = (ai_meta.month or parsed_local.get("month") or "").strip()
+                            if merged_month and not merged_month.endswith("월"):
+                                merged_month = f"{merged_month}월"
+                            merged_grade = (ai_meta.grade or parsed_local.get("grade") or "").strip()
+                            merged_subject = (ai_meta.subject or parsed_local.get("subject") or "").strip()
+                            if merged_year and merged_month and merged_grade and merged_subject:
+                                merged_title = f"{merged_year}년 {merged_month} {merged_grade} {merged_subject}"
+                            else:
+                                merged_title = (
+                                    ai_meta.exam_title
+                                    or parsed_local.get("exam_title")
+                                    or ""
+                                ).strip()
+                            parsed_local = {
+                                "year": merged_year,
+                                "month": merged_month,
+                                "grade": merged_grade,
+                                "subject": merged_subject,
+                                "exam_title": merged_title,
+                            }
+                            ai_verified = True
+                    except Exception:
+                        ai_verified = False
+
             st.session_state["meta_year"] = parsed_local.get("year", "")
             st.session_state["meta_month"] = parsed_local.get("month", "")
             st.session_state["meta_grade"] = parsed_local.get("grade", "")
@@ -1064,7 +1139,9 @@ with tab1:
             st.session_state["tab1_subject_cat"] = infer_subject_category(parsed_local.get("subject", ""))
             st.session_state["tab1_last_loaded_sig"] = file_sig
 
-            if not has_p1_text:
+            if ai_verified and parsed_local.get("exam_title"):
+                st.session_state["tab1_meta_status"] = "verified_ai"
+            elif not has_p1_text and not parsed_local.get("exam_title"):
                 st.session_state["tab1_meta_status"] = "scanned"
             elif parsed_local.get("exam_title"):
                 st.session_state["tab1_meta_status"] = "parsed"
@@ -1073,7 +1150,11 @@ with tab1:
 
         meta_status = st.session_state.get("tab1_meta_status", "")
         if file_sig:
-            if meta_status == "parsed":
+            if meta_status == "verified_ai":
+                st.success(
+                    f"🎯 1차 텍스트 + 2차 AI 비전 표지 교차 검증 완료: **{st.session_state.get('meta_title', '')}** (필요 시 아래에서 수정 가능)"
+                )
+            elif meta_status == "parsed":
                 st.success(
                     f"⚡ 1페이지 즉시 자동 인식 완료: **{st.session_state.get('meta_title', '')}** (필요 시 아래에서 바로 수정하세요)"
                 )
@@ -2087,6 +2168,14 @@ with tab2:
         if current_user.tier == "FREE":
             free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
             free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
+            if free_credits > 0:
+                use_unlocked_38 = st.checkbox(
+                    f"🔓 해금 크레딧 1회 사용해 고급 모델(Gemini 3.8 Flash)로 실행 (보유: {free_credits}회)",
+                    value=False,
+                    key="tab2_free_use_unlock_credit",
+                )
+                if use_unlocked_38:
+                    selected_model = "gemini-3.8-flash"
             if is_premium_model(selected_model):
                 st.info(
                     f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: **{MODEL_LABELS.get(selected_model, selected_model)}** "

@@ -522,3 +522,50 @@ def batch_update_user_tiers(
         err = storage.save_users(users)
         return changed_count, err
     return 0, None
+
+
+def delete_users_by_usernames(
+    storage: StorageManager,
+    target_usernames: list[str],
+    actor_username: str = "",
+) -> tuple[int, str | None, str]:
+    """관리자가 지정한 회원 계정을 users.json 및 Google Drive에서 영구 삭제한다.
+
+    본인 계정 및 마지막 남은 ADMIN 계정은 삭제할 수 없다.
+    반환: (삭제된 계정 수, 저장 오류 메시지 또는 None, 안내/경고 메시지)
+    """
+    actor_norm = normalize_username(actor_username)
+    targets = {normalize_username(u) for u in target_usernames if normalize_username(u)}
+    if not targets:
+        return 0, None, "삭제할 계정을 선택해 주세요."
+
+    users = storage.load_users()
+    admin_count = sum(1 for u in users if u.tier == "ADMIN")
+    remaining: list[UserRecord] = []
+    deleted_count = 0
+    skipped_reasons: list[str] = []
+
+    for u in users:
+        if u.username in targets:
+            if actor_norm and u.username == actor_norm:
+                skipped_reasons.append(f"@{u.username}(본인 계정)")
+                remaining.append(u)
+                continue
+            if u.tier == "ADMIN" and admin_count <= 1:
+                skipped_reasons.append(f"@{u.username}(마지막 관리자)")
+                remaining.append(u)
+                continue
+            if u.tier == "ADMIN":
+                admin_count -= 1
+            deleted_count += 1
+        else:
+            remaining.append(u)
+
+    err: str | None = None
+    if deleted_count > 0:
+        err = storage.save_users(remaining)
+
+    note = ""
+    if skipped_reasons:
+        note = f"보호됨(삭제 제외): {', '.join(skipped_reasons)}"
+    return deleted_count, err, note

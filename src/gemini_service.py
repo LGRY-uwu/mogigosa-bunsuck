@@ -1168,32 +1168,37 @@ def extract_exam_header_metadata(
     model_name: str,
     first_page_text: str,
     first_page_png_bytes: bytes | None = None,
+    filename: str = "",
 ) -> ExamHeaderMetadata:
     """
-    모의고사 PDF 1페이지 텍스트 또는 이미지를 분석해 시행 년도, 월, 학년, 과목, 표준 회차명을 추출한다.
+    모의고사 PDF 1페이지 이미지와 텍스트를 AI로 빠르게 교차 분석해
+    시행 년도, 월, 학년, 과목, 표준 회차명을 정확히 추출한다.
     """
-    client = _build_client(api_key)
+    client = _build_client(api_key, timeout_seconds=20)
 
     system_inst = (
-        "당신은 한국 전국연합학력평가·수능·모의평가 시험지 헤더 메타데이터 파서입니다.\n"
-        "제공된 시험지 1페이지 텍스트 또는 이미지를 보고 다음 5개 필드를 정확히 추출하세요:\n"
-        "1) year: 4자리 시행 년도 문자열 (예: '2026')\n"
-        "2) month: 시행 월 문자열 ('3월', '6월', '9월', '11월' 등. 대학수학능력시험은 '11월'로 표기)\n"
-        "3) grade: 학년 문자열 ('고1', '고2', '고3' 중 하나. 고등학교 3학년/수능/모의평가는 '고3')\n"
-        "4) subject: 시험지 상단 헤더에 적힌 공식 과목명 (예: '국어', '수학', '영어', '한국사', '통합사회', '통합과학', '화학', '경제')\n"
-        "5) exam_title: 반드시 '{year}년 {month} {grade} {subject}' 형식으로 조합 (예: '2026년 9월 고1 통합사회')"
+        "당신은 한국 전국연합학력평가·대학수학능력시험·평가원 모의평가·사설 모의고사 표지/1페이지 헤더 정밀 판독기입니다.\n"
+        "첨부된 시험지 1페이지 이미지(상단 로고, 제목 박스, 영역 표시)와 텍스트·파일명을 종합하여 다음 5개 필드를 정확히 추출하세요:\n"
+        "1) year: 4자리 시행 년도 숫자 문자열 (예: '2026', '2025').\n"
+        "2) month: 시행 월 문자열 ('3월', '4월', '5월', '6월', '7월', '9월', '10월', '11월' 등. 대학수학능력시험 본시험은 '11월').\n"
+        "3) grade: 학년 문자열 ('고1', '고2', '고3' 중 하나. '제1학년'/'고1'→'고1', '제2학년'/'고2'→'고2', '제3학년'/'고3'/수능/모의평가는 '고3').\n"
+        "4) subject: 과목명 (예: '통합과학', '통합사회', '물리학Ⅰ', '화학Ⅰ', '생명과학Ⅰ', '지구과학Ⅰ', '수학', '경제', '사회·문화' 등). 영역명('과학탐구 영역')과 세부 과목명(예: '물리학Ⅰ')이 같이 있으면 세부 과목명을 우선 적으세요.\n"
+        "5) exam_title: 반드시 '{year}년 {month} {grade} {subject}' 형식으로 조합 (예: '2025년 9월 고1 통합과학')."
     )
 
-    text_excerpt = (first_page_text or "").strip()[:4000]
+    text_excerpt = (first_page_text or "").strip()[:3000]
+    fn_hint = f"[업로드 파일명]\n{filename.strip()}\n\n" if filename and filename.strip() else ""
     prompt = (
+        f"{fn_hint}"
         "[시험지 1페이지 텍스트 발췌]\n"
-        f"{text_excerpt if text_excerpt else '(텍스트가 거의 없는 스캔 PDF입니다. 첨부된 1페이지 이미지를 확인하세요.)'}\n\n"
-        "위 1페이지에서 시행 년도, 시행 월, 학년, 과목명과 표준 회차명(exam_title)을 JSON으로 반환하세요."
+        f"{text_excerpt if text_excerpt else '(텍스트가 거의 없는 스캔 PDF입니다. 첨부된 1페이지 이미지를 정밀 판독하세요.)'}\n\n"
+        "위 1페이지 이미지 상단 헤더·로고·과목 박스를 최우선으로 읽고 시행 년도, 시행 월, 학년, 과목명, 표준 회차명(exam_title)을 JSON으로 반환하세요."
     )
 
     contents: list[Any] = []
     if first_page_png_bytes:
-        contents.append(types.Part.from_bytes(data=first_page_png_bytes, mime_type="image/png"))
+        opt_png = optimize_image_for_vision(first_page_png_bytes, max_width=1200)
+        contents.append(types.Part.from_bytes(data=opt_png, mime_type="image/png"))
     contents.append(prompt)
 
     resp = _generate_content_with_fallback(
@@ -1206,6 +1211,7 @@ def extract_exam_header_metadata(
             response_schema=ExamHeaderMetadata,
             temperature=0.0,
         ),
+        fast_mode=True,
     )
     meta = _parse_structured(resp, ExamHeaderMetadata)
 
