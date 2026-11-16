@@ -25,6 +25,9 @@ MODEL_LABELS: dict[str, str] = {
 }
 DEFAULT_MODEL: str = "gemini-3.5-flash"
 EXAM_TAGGING_MODEL: str = "gemini-3.5-flash-lite"
+CONCEPT_DB_BUILD_MODEL: str = "gemini-3.8-flash"
+CONCEPT_SCOPE_MODEL: str = "gemini-3.5-flash-lite"
+REWRITE_MODEL: str = HYDROGEN_MODEL
 
 
 def resolve_api_model_name(model_choice: str | None) -> str:

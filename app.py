@@ -38,7 +38,16 @@ from src.auth import (
     save_user_custom_api_key,
     verify_session_token,
 )
-from src.config import AVAILABLE_MODELS, DEFAULT_MODEL, EXAM_TAGGING_MODEL, MODEL_LABELS, resolve_credentials
+from src.config import (
+    AVAILABLE_MODELS,
+    CONCEPT_DB_BUILD_MODEL,
+    CONCEPT_SCOPE_MODEL,
+    DEFAULT_MODEL,
+    EXAM_TAGGING_MODEL,
+    MODEL_LABELS,
+    REWRITE_MODEL,
+    resolve_credentials,
+)
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
 from src.exporters import build_exam_html, build_exam_markdown
 from src.gemini_service import (
@@ -732,13 +741,17 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 )
                 st.caption(f"🧹 불필요 페이지 자동 제외 ({len(skipped_info)}쪽): {skip_summary}")
 
-            model_disp = MODEL_LABELS.get(selected_model, selected_model)
+            db_build_model, db_model_notice = resolve_model_for_user(
+                current_user, CONCEPT_DB_BUILD_MODEL
+            )
+            model_disp = MODEL_LABELS.get(db_build_model, db_build_model)
             status_box.info(
-                f"3단계: 사이드바 선택 모델({model_disp})로 단원별 핵심 개념·허용 용어·페이지 범위를 구조화하고 공용 DB에 동기화 중..."
+                f"3단계: {model_disp} 모델로 단원별 핵심 개념·허용 용어·페이지 범위를 구조화하고 공용 DB에 동기화 중..."
+                + (f" ({db_model_notice})" if db_model_notice else "")
             )
             extracted_book = extract_concept_book_units(
                 api_key=active_gemini_key,
-                model_name=selected_model,
+                model_name=db_build_model,
                 book_title=book_title_in.strip(),
                 subject_and_grade=subject_grade_in.strip(),
                 page_ranges_display=stats["ranges_display"],
@@ -748,6 +761,7 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                 kept_pages=stats.get("kept_pages"),
                 status_callback=lambda m: status_box.info(m),
             )
+            consume_premium_model_usage(storage, current_user.username, db_build_model)
             grade_match = re.search(r"(고\s*[123])", subject_grade_in)
             grade_str = (
                 grade_match.group(1).replace(" ", "")
@@ -827,9 +841,12 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                         else:
                             status_box.info("1단계: PyMuPDF로 PDF 전체 페이지 구조 스캔 중...")
                             catalog, has_text_layer = extract_pdf_page_catalog(cb_pdf_bytes)
+                            detect_model, _ = resolve_model_for_user(
+                                current_user, CONCEPT_DB_BUILD_MODEL
+                            )
                             detected_out, detected_intervals = detect_concept_pages_with_ai(
                                 api_key=active_gemini_key,
-                                model_name=selected_model,
+                                model_name=detect_model,
                                 pdf_bytes=cb_pdf_bytes,
                                 page_catalog=catalog,
                                 has_text_layer=has_text_layer,
@@ -1188,16 +1205,34 @@ with tab1:
                 placeholder="예: 2026년 9월 고1 통합사회",
             )
 
+        existing_exam_names = {
+            re.sub(r"\s+", " ", r.exam_name.strip())
+            for r in storage.load_db()
+            if r.exam_name
+        }
+        norm_input_exam = re.sub(r"\s+", " ", exam_name_input.strip())
+        is_duplicate_exam = bool(norm_input_exam and norm_input_exam in existing_exam_names)
+        if is_duplicate_exam:
+            st.error(
+                f"🚫 **'{norm_input_exam}'** 모의고사는 이미 DB에 등록되어 있습니다. "
+                "중복 수집 방지를 위해 크롭 버튼이 비활성화되었습니다."
+            )
+
         parse_col1, parse_col2 = st.columns([1, 1])
         with parse_col1:
-            run_crop_btn = st.button("✂️ 1단계: 2단 편집 분석 및 고해상도 문항 크롭", type="primary", use_container_width=True)
+            run_crop_btn = st.button(
+                "✂️ 1단계: 2단 편집 분석 및 고해상도 문항 크롭",
+                type="primary",
+                use_container_width=True,
+                disabled=is_duplicate_exam,
+            )
         with parse_col2:
             vision_fallback_chk = st.checkbox(
                 "스캔(이미지) PDF인 경우 Gemini Vision 좌표 탐지 보조 사용",
                 value=True,
             )
 
-        if run_crop_btn:
+        if run_crop_btn and not is_duplicate_exam:
             if not active_prob_bytes:
                 st.error("문제지 PDF를 업로드하거나 EBSi에서 먼저 추출해 주세요.")
             elif not exam_name_input.strip():
@@ -2099,7 +2134,7 @@ with tab2:
                             try:
                                 wl = extract_concept_whitelist(
                                     api_key=active_gemini_key,
-                                    model_name=selected_model,
+                                    model_name=CONCEPT_SCOPE_MODEL,
                                     sliced_pdf_bytes=sliced_bytes,
                                     sliced_text=sliced_text,
                                     start_page=first_page_num,
@@ -2168,30 +2203,37 @@ with tab2:
         if current_user.tier == "FREE":
             free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
             free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
+            use_unlocked_premium = False
             if free_credits > 0:
-                use_unlocked_38 = st.checkbox(
-                    f"🔓 해금 크레딧 1회 사용해 고급 모델(Gemini 3.8 Flash)로 실행 (보유: {free_credits}회)",
+                use_unlocked_premium = st.checkbox(
+                    f"🔓 해금 크레딧 1회 사용해 PRO/ULTRA/ADMIN 전용 모델(상위 개조: {MODEL_LABELS.get(REWRITE_MODEL, REWRITE_MODEL)})로 실행 (보유: {free_credits}회)",
                     value=False,
                     key="tab2_free_use_unlock_credit",
                 )
-                if use_unlocked_38:
-                    selected_model = "gemini-3.8-flash"
-            if is_premium_model(selected_model):
+            if use_unlocked_premium:
+                match_model = "gemini-3.5-flash"
+                rewrite_model = REWRITE_MODEL
                 st.info(
-                    f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: **{MODEL_LABELS.get(selected_model, selected_model)}** "
+                    f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: 상위 문제 개조 **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
                     f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
                 )
             else:
+                match_model = "gemini-3.5-flash-lite"
+                rewrite_model = "gemini-3.5-flash-lite"
                 prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
                 st.info(
                     f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 추론 실행 "
-                    f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 3.8/Hydrogen 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
+                    f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 PRO/ULTRA/ADMIN 전용 모델 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
                 )
-        elif current_user.tier == "PRO" and is_premium_model(selected_model):
-            st.info(
-                f"💎 **PRO (1,990원/월)** · 주간 고급 모델({MODEL_LABELS.get(selected_model, selected_model)}) "
-                f"남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**"
-            )
+        else:
+            match_model = "gemini-3.5-flash"
+            rewrite_model, rewrite_notice = resolve_model_for_user(current_user, REWRITE_MODEL)
+            if current_user.tier == "PRO":
+                st.info(
+                    f"💎 **PRO (1,990원/월)** · 상위 문제 개조 모델: **{MODEL_LABELS.get(rewrite_model, rewrite_model)}** "
+                    f"(주간 고급 모델 남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**)"
+                    + (f" — {rewrite_notice}" if rewrite_notice else "")
+                )
 
         with st.container(border=True):
             opt_c1, opt_c2, opt_c3 = st.columns(3)
@@ -2252,7 +2294,7 @@ with tab2:
                             try:
                                 judgments = match_questions_to_whitelist(
                                     api_key=active_gemini_key,
-                                    model_name=selected_model,
+                                    model_name=match_model,
                                     candidates=candidates,
                                     whitelist=whitelist,
                                 )
@@ -2315,7 +2357,7 @@ with tab2:
                                     try:
                                         rewritten_obj = rewrite_question_for_pdf(
                                             api_key=active_gemini_key,
-                                            model_name=selected_model,
+                                            model_name=rewrite_model,
                                             question=q,
                                             crop_png_bytes=crop_bytes,
                                             whitelist=whitelist,
@@ -2341,9 +2383,14 @@ with tab2:
                             consume_extraction_quota(
                                 storage, current_user.username, len(assembled)
                             )
-                            updated_u = consume_premium_model_usage(
-                                storage, current_user.username, selected_model
-                            )
+                            rewritten_cnt = sum(1 for it in assembled if it["rewritten"] is not None)
+                            updated_u = None
+                            if is_premium_model(rewrite_model) and (
+                                rewritten_cnt > 0 or current_user.tier == "FREE"
+                            ):
+                                updated_u = consume_premium_model_usage(
+                                    storage, current_user.username, rewrite_model
+                                )
                             st.session_state["matched_items"] = assembled
                             st.session_state["generated_exam_pdf"] = None
                             st.session_state["user_answers"] = {}
@@ -2351,16 +2398,16 @@ with tab2:
                             st.session_state["ai_explanations"] = {}
                             st.session_state["ai_chats"] = {}
                             rem_msg = ""
-                            if updated_u is not None and is_premium_model(selected_model):
+                            if updated_u is not None and is_premium_model(rewrite_model):
                                 if updated_u.tier == "FREE":
-                                    rem_msg = f" | 남은 고급 모델 해금 크레딧: {updated_u.premium_unlock_credits}회"
+                                    rem_msg = f" | 남은 고급 모델 해금 크레딧: {int(getattr(updated_u, 'premium_unlock_credits', 0) or 0)}회"
                                 elif updated_u.tier == "PRO":
                                     pro_rem = get_remaining_pro_weekly_quota(updated_u)
                                     rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}회"
                             st.success(
                                 f"🎯 총 {len(assembled)}문항 추출 완료! "
                                 f"(원문 그대로 {sum(1 for it in assembled if it['rewritten'] is None)}문항 · "
-                                f"개념서 기준 개조 {sum(1 for it in assembled if it['rewritten'] is not None)}문항){rem_msg}"
+                                f"개념서 기준 개조 {rewritten_cnt}문항){rem_msg}"
                             )
 
     # -----------------------------------------------------------------------
