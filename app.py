@@ -144,6 +144,8 @@ def _init_session_defaults() -> None:
         "stage2_failed_errors": [],
         "stage2_sync_err": "",
         "trigger_retry_failed": False,
+        "db_search_submitted": False,
+        "db_search_filters": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1534,34 +1536,121 @@ with tab1:
                     )
                 st.rerun()
 
+    def _extract_exam_search_attrs(exam_name: str, subj_cat: str) -> dict[str, str]:
+        ym = re.search(r"(20\d{2})", exam_name or "")
+        mm = re.search(r"(\d{1,2})\s*월", exam_name or "")
+        gm = re.search(r"고\s*([123])", exam_name or "")
+        return {
+            "year": f"{ym.group(1)}년" if ym else "",
+            "month": f"{int(mm.group(1))}월" if mm else "",
+            "grade": f"고{gm.group(1)}" if gm else "",
+            "subject": subj_cat or "",
+        }
+
     if not db_records:
         st.info("아직 저장된 기출 문항이 없습니다. 위에서 모의고사 PDF를 수집·태깅해 보세요.")
     else:
-        subject_order = ["전체", "수학", "사회", "과학"]
-        subj_counts = {
-            s: (len(db_records) if s == "전체" else sum(1 for r in db_records if r.subject_category == s))
-            for s in subject_order
+        exam_groups: dict[tuple[str, str], list[QuestionRecord]] = {}
+        for rec in db_records:
+            exam_groups.setdefault((rec.subject_category, rec.exam_name), []).append(rec)
+
+        exam_attr_map: dict[tuple[str, str], dict[str, str]] = {
+            k: _extract_exam_search_attrs(k[1], k[0]) for k in exam_groups
         }
-        subj_tabs = st.tabs([f"{s} ({subj_counts[s]})" for s in subject_order])
 
-        for tab_obj, subj_label in zip(subj_tabs, subject_order):
-            with tab_obj:
-                subj_recs = (
-                    list(db_records)
-                    if subj_label == "전체"
-                    else [r for r in db_records if r.subject_category == subj_label]
+        avail_years = sorted(
+            {v["year"] for v in exam_attr_map.values() if v["year"]},
+            reverse=True,
+        )
+        avail_months = sorted(
+            {v["month"] for v in exam_attr_map.values() if v["month"]},
+            key=lambda m: int(re.sub(r"[^0-9]", "", m) or 0),
+        )
+        avail_grades = ["고1", "고2", "고3"]
+        avail_subjects = ["수학", "사회", "과학"]
+
+        with st.form("db_search_form", border=True):
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1:
+                sel_year = st.selectbox(
+                    "시행 년도",
+                    options=["전체"] + avail_years,
+                    key="db_search_year",
                 )
-                if not subj_recs:
-                    st.info(f"'{subj_label}' 과목에 저장된 모의고사가 없습니다.")
+            with sc2:
+                sel_month = st.selectbox(
+                    "시행 월",
+                    options=["전체"] + avail_months,
+                    key="db_search_month",
+                )
+            with sc3:
+                sel_grade = st.selectbox(
+                    "학년",
+                    options=["전체"] + avail_grades,
+                    key="db_search_grade",
+                )
+            with sc4:
+                sel_subject = st.selectbox(
+                    "과목",
+                    options=["전체"] + avail_subjects,
+                    key="db_search_subject",
+                )
+
+            btn_c1, btn_c2 = st.columns([3, 1])
+            with btn_c1:
+                search_clicked = st.form_submit_button(
+                    "🔍 기출 DB 검색 (파일·문항 불러오기)",
+                    type="primary",
+                    use_container_width=True,
+                )
+            with btn_c2:
+                reset_clicked = st.form_submit_button(
+                    "🧹 검색 초기화",
+                    use_container_width=True,
+                )
+
+        if search_clicked:
+            st.session_state["db_search_submitted"] = True
+            st.session_state["db_search_filters"] = {
+                "year": sel_year,
+                "month": sel_month,
+                "grade": sel_grade,
+                "subject": sel_subject,
+            }
+        elif reset_clicked:
+            st.session_state["db_search_submitted"] = False
+            st.session_state["db_search_filters"] = {}
+
+        if not st.session_state.get("db_search_submitted"):
+            st.info(
+                "시행 년도 · 시행 월 · 학년 · 과목을 선택한 뒤 **'🔍 기출 DB 검색'**을 누르면 "
+                "해당 모의고사 파일과 문항 목록을 불러옵니다."
+            )
+        else:
+            flt = st.session_state.get("db_search_filters") or {}
+            f_year = flt.get("year", "전체")
+            f_month = flt.get("month", "전체")
+            f_grade = flt.get("grade", "전체")
+            f_subject = flt.get("subject", "전체")
+
+            matched_keys: list[tuple[str, str]] = []
+            for key_pair in sorted(exam_groups.keys(), key=lambda x: (x[0], x[1]), reverse=True):
+                attrs = exam_attr_map[key_pair]
+                if f_year != "전체" and attrs["year"] != f_year:
                     continue
+                if f_month != "전체" and attrs["month"] != f_month:
+                    continue
+                if f_grade != "전체" and attrs["grade"] != f_grade:
+                    continue
+                if f_subject != "전체" and attrs["subject"] != f_subject:
+                    continue
+                matched_keys.append(key_pair)
 
-                exam_groups: dict[tuple[str, str], list[QuestionRecord]] = {}
-                for rec in subj_recs:
-                    exam_groups.setdefault((rec.subject_category, rec.exam_name), []).append(rec)
-
-                for (subj_cat, exam_name) in sorted(
-                    exam_groups.keys(), key=lambda x: (x[0], x[1]), reverse=True
-                ):
+            if not matched_keys:
+                st.warning("선택한 조건(시행 년도·시행 월·학년·과목)에 일치하는 기출 회차가 없습니다.")
+            else:
+                st.success(f"검색 결과: 총 **{len(matched_keys)}개** 모의고사 회차를 불러왔습니다.")
+                for subj_cat, exam_name in matched_keys:
                     exam_recs = sorted(exam_groups[(subj_cat, exam_name)], key=lambda r: r.q_num)
                     safe_fn_prefix = sanitize_id_part(exam_name)
 
@@ -1577,7 +1666,7 @@ with tab1:
                         with head_col2:
                             if st.button(
                                 "🗑️ 회차 삭제",
-                                key=f"del_exam_{subj_label}_{subj_cat}_{safe_fn_prefix}",
+                                key=f"del_exam_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             ):
                                 cnt = storage.delete_exam(exam_name)
@@ -1600,7 +1689,7 @@ with tab1:
                                 data=html_str.encode("utf-8"),
                                 file_name=f"{safe_fn_prefix}_기출정리.html",
                                 mime="text/html",
-                                key=f"dl_html_{subj_label}_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_html_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             )
                         with dl_c2:
@@ -1610,7 +1699,7 @@ with tab1:
                                 data=md_str.encode("utf-8"),
                                 file_name=f"{safe_fn_prefix}_기출정리.md",
                                 mime="text/markdown",
-                                key=f"dl_md_{subj_label}_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_md_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             )
                         with dl_c3:
@@ -1624,7 +1713,7 @@ with tab1:
                                 data=json_str.encode("utf-8"),
                                 file_name=f"{safe_fn_prefix}_문제목록.json",
                                 mime="application/json",
-                                key=f"dl_json_{subj_label}_{subj_cat}_{safe_fn_prefix}",
+                                key=f"dl_json_search_{subj_cat}_{safe_fn_prefix}",
                                 use_container_width=True,
                             )
 
@@ -1642,7 +1731,7 @@ with tab1:
                                     data=prob_bytes,
                                     file_name=prob_pdf_name,
                                     mime="application/pdf",
-                                    key=f"dl_prob_{subj_label}_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"dl_prob_search_{subj_cat}_{safe_fn_prefix}",
                                     use_container_width=True,
                                 )
                         with dl_c5:
@@ -1657,7 +1746,7 @@ with tab1:
                                     data=ans_bytes,
                                     file_name=ans_pdf_name,
                                     mime="application/pdf",
-                                    key=f"dl_ans_{subj_label}_{subj_cat}_{safe_fn_prefix}",
+                                    key=f"dl_ans_search_{subj_cat}_{safe_fn_prefix}",
                                     use_container_width=True,
                                 )
 
@@ -1684,7 +1773,7 @@ with tab1:
                                     st.write(f"**공식 해설:** {rec.official_explanation}")
                                     if st.button(
                                         "이 문항 삭제",
-                                        key=f"del_q_{subj_label}_{rec.id}",
+                                        key=f"del_q_search_{rec.id}",
                                     ):
                                         storage.delete_question(rec.id)
                                         st.rerun()
