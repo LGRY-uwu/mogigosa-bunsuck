@@ -287,8 +287,9 @@ with st.sidebar:
         pro_weekly_rem = get_remaining_pro_weekly_quota(current_user)
 
         if tier_code == "FREE":
-            upload_prog = current_user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK
-            credits = current_user.premium_unlock_credits
+            free_uploaded_cnt = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
+            upload_prog = free_uploaded_cnt % FREE_EXAMS_PER_UNLOCK
+            credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
             status_line = (
                 f"<div style='font-size:0.83rem; color:#334155; margin-top:0.45rem;'>"
                 f"기출 업로드: <b>무제한</b> (기본 추론 3.5 Flash-Lite)<br/>"
@@ -338,7 +339,7 @@ with st.sidebar:
         )
 
         if tier_code == "FREE":
-            st.progress((current_user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK) / FREE_EXAMS_PER_UNLOCK)
+            st.progress((int(getattr(current_user, "uploaded_exam_count", 0) or 0) % FREE_EXAMS_PER_UNLOCK) / FREE_EXAMS_PER_UNLOCK)
         elif tier_code == "PRO" and pro_weekly_rem is not None:
             st.progress(pro_weekly_rem / PRO_WEEKLY_PREMIUM_LIMIT)
 
@@ -407,7 +408,7 @@ with st.sidebar:
         if model_notice:
             st.caption(f"ℹ️ {model_notice}")
         elif tier_code == "FREE" and is_premium_model(selected_model):
-            st.caption(f"🔓 해금 크레딧 1회 사용 예정 (보유: {current_user.premium_unlock_credits}회)")
+            st.caption(f"🔓 해금 크레딧 1회 사용 예정 (보유: {int(getattr(current_user, 'premium_unlock_credits', 0) or 0)}회)")
 
         # 저장소 & DB 요약
         all_records = storage.load_db()
@@ -496,9 +497,9 @@ def _render_admin_panel() -> None:
             "현재 등급": u.tier,
             "등급 설명": TIER_LABELS.get(u.tier, u.tier),
             "개인 키": mask_api_key(u.custom_api_key) or "-",
-            "기출 업로드": u.uploaded_exam_count,
-            "해금 크레딧": u.premium_unlock_credits,
-            "주간 고급사용": u.weekly_premium_count,
+            "기출 업로드": int(getattr(u, "uploaded_exam_count", 0) or 0),
+            "해금 크레딧": int(getattr(u, "premium_unlock_credits", 0) or 0),
+            "주간 고급사용": int(getattr(u, "weekly_premium_count", 0) or 0),
         }
         for u in filtered_users
     ]
@@ -2084,13 +2085,15 @@ with tab2:
         is_premium = can_use_premium_features(current_user)
         pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
         if current_user.tier == "FREE":
+            free_credits = int(getattr(current_user, "premium_unlock_credits", 0) or 0)
+            free_uploads = int(getattr(current_user, "uploaded_exam_count", 0) or 0)
             if is_premium_model(selected_model):
                 st.info(
                     f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: **{MODEL_LABELS.get(selected_model, selected_model)}** "
-                    f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {current_user.premium_unlock_credits}회)"
+                    f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {free_credits}회)"
                 )
             else:
-                prog_mod = current_user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK
+                prog_mod = free_uploads % FREE_EXAMS_PER_UNLOCK
                 st.info(
                     f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 추론 실행 "
                     f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 3.8/Hydrogen 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"

@@ -172,12 +172,13 @@ def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) ->
     """자정(KST) · 주간(KST) 초기화 및 관리자 아이디 자동 ADMIN 승급을 동기화한다."""
     changed = False
     current_week = get_kst_week_str()
-    if user.last_used_date != today:
+    if getattr(user, "last_used_date", "") != today:
         user.daily_count = 0
         user.last_used_date = today
         changed = True
-    if user.last_used_week != current_week:
-        user.weekly_premium_count = 0
+    if hasattr(user, "last_used_week") and getattr(user, "last_used_week", "") != current_week:
+        if hasattr(user, "weekly_premium_count"):
+            user.weekly_premium_count = 0
         user.last_used_week = current_week
         changed = True
     if user.username in admin_usernames and user.tier != "ADMIN":
@@ -350,8 +351,12 @@ def get_remaining_pro_weekly_quota(user: UserRecord) -> int | None:
     if user.tier != "PRO":
         return None
     current_week = get_kst_week_str()
-    used_week = user.weekly_premium_count if user.last_used_week == current_week else 0
-    return max(0, PRO_WEEKLY_PREMIUM_LIMIT - used_week)
+    used_week = (
+        getattr(user, "weekly_premium_count", 0)
+        if getattr(user, "last_used_week", "") == current_week
+        else 0
+    )
+    return max(0, PRO_WEEKLY_PREMIUM_LIMIT - int(used_week or 0))
 
 
 def can_use_premium_features(user: UserRecord) -> bool:
@@ -388,10 +393,12 @@ def resolve_model_for_user(user: UserRecord, requested_model: str) -> tuple[str,
         return req, ""
 
     # FREE 등급
+    credits = int(getattr(user, "premium_unlock_credits", 0) or 0)
+    uploaded_cnt = int(getattr(user, "uploaded_exam_count", 0) or 0)
     if is_premium_model(req):
-        if user.premium_unlock_credits > 0:
+        if credits > 0:
             return req, ""
-        progress = user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK
+        progress = uploaded_cnt % FREE_EXAMS_PER_UNLOCK
         return (
             "gemini-3.5-flash-lite",
             f"FREE 등급은 기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 고급 모델(3.8/Hydrogen) 1회 해금됩니다 "
