@@ -26,6 +26,8 @@ from src.models import (
     QuestionMatchJudgment,
     QuestionRecord,
     RewrittenQuestion,
+    TocExtractionOutput,
+    TocUnitItem,
 )
 from src.pdf_parser import extract_specific_pages_slice
 
@@ -571,6 +573,83 @@ def analyze_exam_pdf_batch_with_gemini(
     return out
 
 
+def _extract_concept_toc_with_ai(
+    client: genai.Client,
+    model_name: str,
+    pdf_bytes: bytes,
+    page_catalog: list[dict[str, Any]],
+    has_text_layer: bool,
+    book_title: str = "",
+    subject_and_grade: str = "",
+    status_callback: Callable[[str], None] | None = None,
+) -> list[TocUnitItem]:
+    """
+    개념서·교과서 PDF 앞부분 및 목차 페이지를 1차로 분석해
+    전체 대단원/중단원 목록(toc_units)을 먼저 추출한다.
+    """
+    total_pages = len(page_catalog)
+    front_pages = set(range(1, min(total_pages, 15) + 1))
+    for entry in page_catalog:
+        if "목차" in (entry.get("noise_hint") or "") or "차례" in (entry.get("snippet") or "")[:60]:
+            front_pages.add(entry["page"])
+    target_pages = sorted(front_pages)[:18]
+    if not target_pages:
+        return []
+
+    if status_callback is not None:
+        status_callback(
+            f"📑 1단계: 목차(차례) 분석 중 ({target_pages[0]}~{target_pages[-1]}쪽 · 모델: {model_name})..."
+        )
+
+    toc_system = (
+        "당신은 한국 교과서·개념서(완자, 개념원리, 수능특강 등)의 목차(차례)를 정밀 추출하는 AI입니다.\n"
+        "제공된 PDF 앞부분에서 목차/차례 부분을 찾아 **모든 대단원과 중단원**을 빠짐없이 순서대로 나열하세요.\n"
+        "- unit_name: 목차에 적힌 단원명 (예: 'Ⅰ. 물질의 규칙성과 결합 - 1. 지구와 생명체를 이루는 원소의 생성')\n"
+        "- book_page_hint: 목차에 적힌 책 쪽수 (있으면 적고, 없으면 빈 문자열)\n"
+        "- 목차 페이지가 명확하지 않더라도 본문 앞부분에 나타나는 단원 제목들을 최대한 정리하세요."
+    )
+
+    try:
+        if has_text_layer:
+            lines = []
+            by_page = {e["page"]: e for e in page_catalog}
+            for p_num in target_pages:
+                e = by_page.get(p_num, {})
+                snip = (e.get("snippet") or "").replace("\n", " | ")[:450]
+                lines.append(f"[p.{p_num}] {snip}")
+            prompt = (
+                f"- 교재명: {book_title or '(미입력)'} | 과목/학년: {subject_and_grade or '(미입력)'}\n\n"
+                "아래 앞부분 페이지 발췌에서 목차(차례)를 찾아 전체 단원 목록(toc_units)을 JSON으로 반환하세요.\n\n"
+                + "\n".join(lines)
+            )
+            contents: Any = prompt
+        else:
+            slice_b, _ = extract_specific_pages_slice(pdf_bytes, target_pages[:12])
+            pdf_part = prepare_pdf_part(client, slice_b, display_name="concept_toc_front.pdf")
+            prompt = (
+                f"- 교재명: {book_title or '(미입력)'} | 과목/학년: {subject_and_grade or '(미입력)'}\n"
+                "첨부된 앞부분 PDF에서 목차(차례) 페이지를 찾아 전체 대단원/중단원 목록(toc_units)을 빠짐없이 JSON으로 반환하세요."
+            )
+            contents = [pdf_part, prompt]
+
+        resp = _generate_content_with_fallback(
+            client=client,
+            model_name=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=toc_system,
+                response_mime_type="application/json",
+                response_schema=TocExtractionOutput,
+                temperature=0.0,
+            ),
+            status_callback=status_callback,
+        )
+        parsed = _parse_structured(resp, TocExtractionOutput)
+        return [u for u in parsed.toc_units if u.unit_name.strip()]
+    except Exception:
+        return []
+
+
 def detect_concept_pages_with_ai(
     api_key: str,
     model_name: str,
@@ -582,18 +661,48 @@ def detect_concept_pages_with_ai(
     status_callback: Callable[[str], None] | None = None,
 ) -> tuple[AutoConceptPageDetectionOutput, list[tuple[int, int]]]:
     """
-    AI(사이드바 선택 모델)가 개념서·교과서 PDF 전체 구조를 분석해
-    표지·목차·연습문제·실전문제·정답 및 해설을 제외하고
-    '순수 개념 설명 구간'의 페이지 범위(start_page~end_page)를 자동 판별한다.
+    1) 먼저 목차(차례)를 분석해 전체 단원 기준표를 확보하고,
+    2) 목차 단원과 본문 페이지를 1:1 대조해 표지·목차·연습문제·정답지를 제외한
+       '순수 개념 설명 구간'을 빠짐없이 판별한다.
     """
     total_pages = len(page_catalog)
     if total_pages == 0:
         raise ValueError("PDF에 페이지가 없습니다.")
 
     client = _build_client(api_key, timeout_seconds=60)
+
+    # 1단계: 목차 먼저 분석
+    toc_items = _extract_concept_toc_with_ai(
+        client=client,
+        model_name=model_name,
+        pdf_bytes=pdf_bytes,
+        page_catalog=page_catalog,
+        has_text_layer=has_text_layer,
+        book_title=book_title,
+        subject_and_grade=subject_and_grade,
+        status_callback=status_callback,
+    )
+    toc_unit_names = [t.unit_name.strip() for t in toc_items if t.unit_name.strip()]
+    toc_guide_block = ""
+    if toc_items:
+        toc_lines = [
+            f"  {idx}. {t.unit_name.strip()}"
+            + (f" (목차 쪽수: {t.book_page_hint.strip()})" if t.book_page_hint.strip() else "")
+            for idx, t in enumerate(toc_items, start=1)
+        ]
+        toc_guide_block = (
+            "[1단계 목차 분석 결과 — 본문 대조 기준표]\n"
+            + "\n".join(toc_lines)
+            + "\n※ 위 목차의 단원이 하나도 누락되지 않도록 본문에서 해당 단원의 순수 개념 설명 구간을 모두 대조해 찾으세요.\n\n"
+        )
+        if status_callback is not None:
+            status_callback(
+                f"📋 목차 {len(toc_items)}개 단원 확인 완료 → 2단계: 목차 기준 본문 개념 구간 대조 중..."
+            )
+
     system_inst = (
         "당신은 대한민국 교과서 및 개념서(완자, 개념원리, 수능특강 등) PDF 구조 판별 AI입니다.\n"
-        "주어진 PDF 페이지 목록 또는 페이지를 보고 **순수 개념·이론·원리·공식 설명이 수록된 페이지 구간만** 정확히 판별하세요.\n"
+        "1단계에서 추출한 [목차 단원 기준표]와 본문 페이지를 대조하여 **단원 누락 없이 순수 개념·이론·원리·공식 설명이 수록된 페이지 구간만** 정확히 판별하세요.\n"
         "반드시 제외해야 하는 페이지:\n"
         "- 표지, 머리말, 책의 구성과 특징, 목차(차례)\n"
         "- 개념 확인 문제 외의 실전 문제, 내신 만점 문제, 수능 기출 문제, 연습 문제, 단원 마무리 문제 전용 페이지\n"
@@ -601,7 +710,7 @@ def detect_concept_pages_with_ai(
         "반드시 포함해야 하는 페이지:\n"
         "- 대단원/중단원 도입, 핵심 개념 정리, 개념 설명 본문, 탐구 활동·자료 분석·실험 원리 설명, 필수 공식 및 용어 정리 페이지\n"
         "출력 규칙:\n"
-        "- detected_ranges에는 연속된 개념 페이지 구간마다 unit_hint(단원/주제명), start_page, end_page(1-based PDF 쪽번호), reason을 적으세요.\n"
+        "- detected_ranges에는 연속된 개념 페이지 구간마다 unit_hint(가급적 목차 기준표의 단원명을 그대로 사용), start_page, end_page(1-based PDF 쪽번호), reason을 적으세요.\n"
         "- excluded_summary에는 제외한 표지/목차/문제/정답 구간을 간단히 요약하세요."
     )
 
@@ -625,7 +734,8 @@ def detect_concept_pages_with_ai(
             prompt = (
                 f"- 교재명: {book_title or '(미입력)'} | 과목/학년: {subject_and_grade or '(미입력)'}\n"
                 f"- 분석 대상 구간: PDF {batch[0]['page']}쪽 ~ {batch[-1]['page']}쪽 (전체 {total_pages}쪽)\n\n"
-                "아래 페이지별 발췌 내용을 보고 순수 개념 설명 구간(`detected_ranges`)만 판별해 JSON으로 반환하세요.\n\n"
+                f"{toc_guide_block}"
+                "아래 페이지별 발췌 내용을 위 목차 기준표와 대조해, 순수 개념 설명 구간(`detected_ranges`)만 빠짐없이 판별해 JSON으로 반환하세요.\n\n"
                 + "\n".join(lines)
             )
             resp = _generate_content_with_fallback(
@@ -660,9 +770,10 @@ def detect_concept_pages_with_ai(
             prompt = (
                 f"- 교재명: {book_title or '(미입력)'} | 과목/학년: {subject_and_grade or '(미입력)'}\n"
                 f"- 첨부된 PDF는 원본의 **실제 {batch_pages[0]}쪽 ~ {batch_pages[-1]}쪽**입니다 "
-                f"(첨부 PDF 1쪽 = 원본 {batch_pages[0]}쪽).\n"
-                "각 페이지를 시각적으로 확인하여 목차·문제풀이·정답지를 제외하고 "
-                "순수 개념 설명이 들어있는 원본 페이지 번호 범위(`start_page`, `end_page`)를 반환하세요."
+                f"(첨부 PDF 1쪽 = 원본 {batch_pages[0]}쪽).\n\n"
+                f"{toc_guide_block}"
+                "각 페이지를 시각적으로 확인하고 위 목차 기준표와 대조하여 목차·문제풀이·정답지를 제외하고 "
+                "순수 개념 설명이 들어있는 원본 페이지 번호 범위(`start_page`, `end_page`)를 빠짐없이 반환하세요."
             )
             resp = _generate_content_with_fallback(
                 client=client,
@@ -709,6 +820,7 @@ def detect_concept_pages_with_ai(
 
     valid_items.sort(key=lambda x: (x.start_page, x.end_page))
     merged_result = AutoConceptPageDetectionOutput(
+        toc_units=toc_unit_names,
         detected_ranges=valid_items,
         excluded_summary=" / ".join(dict.fromkeys(excluded_notes)),
     )

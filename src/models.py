@@ -141,9 +141,29 @@ class AutoConceptRangeItem(BaseModel):
     reason: str = Field(default="", description="개념 설명 구간으로 판별한 근거 요약")
 
 
+class TocUnitItem(BaseModel):
+    """개념서·교과서 목차(차례)에서 추출한 단원 항목."""
+
+    unit_name: str = Field(..., description="목차에 기재된 대단원/중단원명")
+    book_page_hint: str = Field(default="", description="목차에 적힌 책 쪽수 (예: '12', 'p.184~189')")
+
+
+class TocExtractionOutput(BaseModel):
+    """개념서·교과서 앞부분 목차 분석 결과."""
+
+    toc_units: list[TocUnitItem] = Field(
+        default_factory=list,
+        description="목차 순서대로 추출한 전체 대단원/중단원 목록",
+    )
+
+
 class AutoConceptPageDetectionOutput(BaseModel):
     """AI가 개념서 PDF 전체를 훑어 목차·정답·문제풀이를 제외하고 개념 페이지만 추출한 결과."""
 
+    toc_units: list[str] = Field(
+        default_factory=list,
+        description="목차(차례)에서 먼저 추출한 전체 단원명 기준 목록",
+    )
     detected_ranges: list[AutoConceptRangeItem] = Field(
         default_factory=list,
         description="순수 개념/원리/이론 설명이 수록된 PDF 페이지 구간 목록",

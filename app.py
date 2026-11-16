@@ -893,6 +893,11 @@ def _render_concept_book_builder_section(key_prefix: str = "tab3") -> None:
                     f"🤖 AI가 자동 판별한 개념 구간 ({det_spec} · {sum(e - s + 1 for s, e in det_ints)}쪽)",
                     expanded=True,
                 ):
+                    if getattr(det_out, "toc_units", None):
+                        st.caption(
+                            f"📑 **목차 분석 기준 단원 ({len(det_out.toc_units)}개):** "
+                            + " · ".join(det_out.toc_units)
+                        )
                     for r_item in det_out.detected_ranges:
                         st.write(
                             f"- **{r_item.unit_hint}**: `p.{r_item.start_page}~p.{r_item.end_page}`"
