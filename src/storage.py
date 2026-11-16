@@ -270,8 +270,12 @@ class StorageManager:
         )
         return created.get("id")
 
-    def sync_on_startup(self) -> dict[str, Any]:
-        """앱 시작 시 Google Drive의 db.json, users.json 및 과목·회차별 폴더를 로컬과 동기화한다."""
+    def sync_on_startup(self, sync_media: bool = False) -> dict[str, Any]:
+        """앱 시작 시 Google Drive의 db.json, users.json, 개념서 DB를 로컬과 동기화한다.
+
+        기본값(sync_media=False)에서는 메타데이터 JSON만 단일 루트 조회로 빠르게 동기화하며,
+        개별 PNG/PDF는 get_crop_bytes/get_pdf_bytes 호출 시 온디맨드로 내려받는다.
+        """
         result: dict[str, Any] = {
             "connected": self.drive_connected,
             "folder_name": self.drive_folder_name,
@@ -285,13 +289,21 @@ class StorageManager:
             return result
 
         try:
+            # 루트 폴더를 1회만 조회해 불필요한 반복 API 왕복을 제거
+            root_children = self._list_children(self.drive_folder_id)
+            root_files_by_name: dict[str, dict[str, Any]] = {}
+            root_folders: list[dict[str, Any]] = []
+            root_folders_by_name: dict[str, dict[str, Any]] = {}
+            for item in root_children:
+                if item.get("mimeType") == FOLDER_MIME:
+                    root_folders.append(item)
+                    root_folders_by_name[item["name"]] = item
+                else:
+                    root_files_by_name[item["name"]] = item
+
             # 1) db.json 동기화
-            root_files = self._list_children(
-                self.drive_folder_id,
-                extra_query="name = 'db.json'",
-            )
-            if root_files:
-                db_bytes = self._download_file_bytes(root_files[0]["id"])
+            if "db.json" in root_files_by_name:
+                db_bytes = self._download_file_bytes(root_files_by_name["db.json"]["id"])
                 self.db_path.write_bytes(db_bytes)
                 result["db_synced"] = True
             elif self.db_path.exists():
@@ -304,12 +316,8 @@ class StorageManager:
                 result["db_synced"] = True
 
             # 1-b) users.json 동기화
-            user_files = self._list_children(
-                self.drive_folder_id,
-                extra_query="name = 'users.json'",
-            )
-            if user_files:
-                users_bytes = self._download_file_bytes(user_files[0]["id"])
+            if "users.json" in root_files_by_name:
+                users_bytes = self._download_file_bytes(root_files_by_name["users.json"]["id"])
                 self.users_path.write_bytes(users_bytes)
                 result["users_synced"] = True
             elif self.users_path.exists():
@@ -322,12 +330,8 @@ class StorageManager:
                 result["users_synced"] = True
 
             # 1-c) 공용 개념서 DB (concept_books.json 및 concept_db 하위 JSON) 동기화
-            cbook_files = self._list_children(
-                self.drive_folder_id,
-                extra_query="name = 'concept_books.json'",
-            )
-            if cbook_files:
-                cb_bytes = self._download_file_bytes(cbook_files[0]["id"])
+            if "concept_books.json" in root_files_by_name:
+                cb_bytes = self._download_file_bytes(root_files_by_name["concept_books.json"]["id"])
                 self.concept_books_path.write_bytes(cb_bytes)
                 result["concept_books_synced"] = True
             elif self.concept_books_path.exists():
@@ -339,9 +343,9 @@ class StorageManager:
                 )
                 result["concept_books_synced"] = True
 
-            concept_dir_id = self._find_drive_subfolder("concept_db")
-            if concept_dir_id:
-                for item in self._list_children(concept_dir_id, extra_query=f"mimeType != '{FOLDER_MIME}'"):
+            concept_folder = root_folders_by_name.get("concept_db")
+            if concept_folder and not result.get("concept_books_synced"):
+                for item in self._list_children(concept_folder["id"], extra_query=f"mimeType != '{FOLDER_MIME}'"):
                     if not item["name"].lower().endswith(".json"):
                         continue
                     target = self.concept_root / item["name"]
@@ -349,11 +353,11 @@ class StorageManager:
                     if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
                         target.write_bytes(self._download_file_bytes(item["id"]))
 
+            if not sync_media:
+                return result
+
             # 2) 과목별/회차별 폴더 동기화 (수학/사회/과학/<회차명>/*)
-            for root_item in self._list_children(
-                self.drive_folder_id,
-                extra_query=f"mimeType = '{FOLDER_MIME}'",
-            ):
+            for root_item in root_folders:
                 fname = root_item["name"]
                 if fname in ("crops", "pdfs", "concept_db"):
                     continue
@@ -386,18 +390,18 @@ class StorageManager:
                                 result["pdfs_downloaded"] += 1
 
             # 3) 레거시 crops / pdfs 폴더 하위 호환 동기화 (폴더가 존재하는 경우만)
-            legacy_crops_id = self._find_drive_subfolder("crops")
-            if legacy_crops_id:
-                for item in self._list_children(legacy_crops_id, extra_query=f"mimeType != '{FOLDER_MIME}'"):
+            legacy_crops = root_folders_by_name.get("crops")
+            if legacy_crops:
+                for item in self._list_children(legacy_crops["id"], extra_query=f"mimeType != '{FOLDER_MIME}'"):
                     target = self.crops_dir / item["name"]
                     remote_size = int(item.get("size", 0) or 0)
                     if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):
                         target.write_bytes(self._download_file_bytes(item["id"]))
                         result["crops_downloaded"] += 1
 
-            legacy_pdfs_id = self._find_drive_subfolder("pdfs")
-            if legacy_pdfs_id:
-                for item in self._list_children(legacy_pdfs_id, extra_query=f"mimeType != '{FOLDER_MIME}'"):
+            legacy_pdfs = root_folders_by_name.get("pdfs")
+            if legacy_pdfs:
+                for item in self._list_children(legacy_pdfs["id"], extra_query=f"mimeType != '{FOLDER_MIME}'"):
                     target = self.pdfs_dir / item["name"]
                     remote_size = int(item.get("size", 0) or 0)
                     if not target.exists() or (remote_size > 0 and target.stat().st_size != remote_size):

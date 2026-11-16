@@ -152,25 +152,46 @@ def _init_session_defaults() -> None:
 _init_session_defaults()
 
 # ---------------------------------------------------------------------------
-# 백그라운드 인증 및 저장소 초기화 (수동 입력창은 UI에서 숨김)
+# 백그라운드 인증 및 저장소 초기화 (서버 캐시 적용으로 새로고침/리런 속도 최적화)
 # ---------------------------------------------------------------------------
-creds = resolve_credentials()
-storage = StorageManager(
-    local_root="./exam_db",
-    service_account_info=creds.service_account_info,
-    drive_folder_id=creds.drive_folder_id,
-    oauth_info=creds.oauth_credentials_info,
-)
+@st.cache_resource(ttl=1800, show_spinner=False)
+def _get_cached_storage(
+    local_root: str,
+    drive_folder_id: str,
+    auth_sig: str,
+    _service_account_info: dict[str, Any] | None,
+    _oauth_info: dict[str, Any] | None,
+) -> StorageManager:
+    return StorageManager(
+        local_root=local_root,
+        service_account_info=_service_account_info,
+        drive_folder_id=drive_folder_id,
+        oauth_info=_oauth_info,
+    )
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _run_startup_drive_sync(_storage: StorageManager, sync_fingerprint: str) -> dict[str, Any]:
+    return _storage.sync_on_startup(sync_media=False)
+
+
+creds = resolve_credentials()
 auth_payload = creds.oauth_credentials_info or creds.service_account_info
 sa_fingerprint = (
     hashlib.sha256(json.dumps(auth_payload, sort_keys=True).encode()).hexdigest()[:12]
     if auth_payload
     else "none"
 )
+storage = _get_cached_storage(
+    local_root="./exam_db",
+    drive_folder_id=creds.drive_folder_id,
+    auth_sig=sa_fingerprint,
+    _service_account_info=creds.service_account_info,
+    _oauth_info=creds.oauth_credentials_info,
+)
 sync_fingerprint = f"{creds.drive_folder_id}:{storage.drive_auth_mode}:{sa_fingerprint}"
 if storage.drive_connected and st.session_state["drive_sync_key"] != sync_fingerprint:
-    sync_out = storage.sync_on_startup()
+    sync_out = _run_startup_drive_sync(storage, sync_fingerprint)
     st.session_state["drive_sync_result"] = sync_out
     if not sync_out.get("error"):
         st.session_state["drive_sync_key"] = sync_fingerprint
@@ -365,6 +386,10 @@ with st.sidebar:
             sync_res = st.session_state.get("drive_sync_result") or {}
             if sync_res.get("error"):
                 st.warning(f"Drive 동기화 오류: {sync_res['error'][:160]}")
+            if st.button("🔄 Drive 최신화", key="sidebar_force_sync_btn", use_container_width=True):
+                _run_startup_drive_sync.clear()
+                st.session_state["drive_sync_key"] = ""
+                st.rerun()
         else:
             st.caption("💾 로컬 영구 저장소 (`./exam_db`, `./concept_db`)")
             if storage.drive_error:
@@ -401,7 +426,8 @@ def _render_admin_panel() -> None:
         st.markdown("<div style='height: 1.65rem;'></div>", unsafe_allow_html=True)
         if st.button("🔄 회원 목록 새로고침", use_container_width=True, key="admin_refresh_btn"):
             if storage.drive_connected:
-                storage.sync_on_startup()
+                _run_startup_drive_sync.clear()
+                storage.sync_on_startup(sync_media=False)
             st.rerun()
 
     users_list = storage.load_users()
