@@ -73,7 +73,7 @@ from src.pdf_parser import (
     extract_answer_snippets_from_pdf,
     extract_concept_pages_by_ranges,
     extract_exam_metadata_fast,
-    extract_first_page_preview,
+    extract_first_page_for_metadata,
     extract_pdf_page_catalog,
     extract_pdf_slice,
     get_page_text_lengths,
@@ -1096,7 +1096,7 @@ with tab1:
                 if active_gemini_key:
                     try:
                         with st.spinner("🔍 1차 텍스트 파싱 + 2차 AI 비전 표지 교차 검증 중..."):
-                            p1_text, p1_png, _ = extract_first_page_preview(active_prob_bytes, dpi=140)
+                            p1_text, p1_png = extract_first_page_for_metadata(active_prob_bytes, dpi=140)
                             if p1_png is None:
                                 p1_png = render_pdf_page_png(active_prob_bytes, 1, dpi=140)
                             ai_meta = extract_exam_header_metadata(
