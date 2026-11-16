@@ -13,7 +13,7 @@ from google.oauth2.service_account import Credentials as ServiceAccountCredentia
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-from src.exporters import build_exam_html, build_exam_markdown
+from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.models import ConceptBookRecord, QuestionRecord, UserRecord
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -445,8 +445,9 @@ class StorageManager:
             json_bytes = json.dumps(
                 [r.model_dump() for r in ordered],
                 ensure_ascii=False,
-                indent=2,
+                separators=(",", ":"),
             ).encode("utf-8")
+            ai_jsonl_bytes = build_exam_ai_jsonl(ordered).encode("utf-8")
             md_bytes = build_exam_markdown(exam, subj, ordered).encode("utf-8")
             html_bytes = build_exam_html(
                 exam,
@@ -458,6 +459,7 @@ class StorageManager:
             ).encode("utf-8")
 
             (exam_dir / "문제목록.json").write_bytes(json_bytes)
+            (exam_dir / "ai_index.jsonl").write_bytes(ai_jsonl_bytes)
             (exam_dir / "기출정리.md").write_bytes(md_bytes)
             (exam_dir / "기출정리.html").write_bytes(html_bytes)
             written_dirs.append(exam_dir)
@@ -466,6 +468,7 @@ class StorageManager:
                 drive_exam_id = self._ensure_drive_exam_folder(subj, exam)
                 if drive_exam_id:
                     self._upsert_drive_file(drive_exam_id, "문제목록.json", json_bytes, "application/json")
+                    self._upsert_drive_file(drive_exam_id, "ai_index.jsonl", ai_jsonl_bytes, "application/x-ndjson")
                     self._upsert_drive_file(drive_exam_id, "기출정리.md", md_bytes, "text/markdown")
                     self._upsert_drive_file(drive_exam_id, "기출정리.html", html_bytes, "text/html")
 
@@ -480,7 +483,7 @@ class StorageManager:
         sync_local_organized: bool = True,
     ) -> str | None:
         payload = [rec.model_dump() for rec in records]
-        raw_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        raw_text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         self.db_path.write_text(raw_text, encoding="utf-8")
 
         errors: list[str] = []

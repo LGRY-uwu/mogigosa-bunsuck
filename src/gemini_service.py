@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import random
 import time
 from typing import Any, Callable, TypeVar
@@ -932,19 +933,26 @@ def match_questions_to_whitelist(
         units_block = "[개념서 단원별 상세 목록]\n" + "\n".join(unit_lines) + "\n\n"
 
     all_judgments: list[QuestionMatchJudgment] = []
-    batch_size = 12
+    batch_size = 25
 
     for i in range(0, len(candidates), batch_size):
         batch = candidates[i : i + batch_size]
-        cand_lines = []
-        for q in batch:
-            cand_lines.append(
-                f"- question_id: {q.id}\n"
-                f"  과목/단원: {q.subject_category} / {q.curriculum_subject} / {q.unit_name} (최저학년: 고{q.min_grade})\n"
-                f"  core_principles: {q.core_principles}\n"
-                f"  required_terms: {q.required_terms}\n"
-                f"  official_explanation: {q.official_explanation}"
+        cand_lines = [
+            json.dumps(
+                {
+                    "id": q.id,
+                    "subj": f"{q.subject_category}/{q.curriculum_subject}",
+                    "unit": q.unit_name,
+                    "gr": q.min_grade,
+                    "prin": q.core_principles,
+                    "terms": q.required_terms,
+                    "exp": q.official_explanation,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
+            for q in batch
+        ]
 
         prompt = (
             f"[참고 교재명] {whitelist.book_title or '업로드 개념서 PDF'}\n"
@@ -952,7 +960,7 @@ def match_questions_to_whitelist(
             f"{units_block}"
             f"[허용 개념·원리 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
             f"[허용 용어 목록 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
-            "[평가할 기출 문항 목록]\n" + "\n".join(cand_lines)
+            "[평가할 기출 문항 목록 (JSONL)]\n" + "\n".join(cand_lines)
         )
 
         resp = _generate_content_with_fallback(
@@ -999,7 +1007,15 @@ def rewrite_question_for_pdf(
         "6. rewritten_choices는 객관식이면 5개 항목 리스트(선지 번호 ①~⑤는 빼고 내용만), 주관식이면 빈 리스트 []로 반환하세요."
     )
 
+    q_text = (getattr(question, "question_text", "") or "").strip()
+    has_visual_cue = any(
+        kw in q_text
+        for kw in ("그림", "그래프", "표", "도표", "모식도", "사진", "지도", "회로", "실험 장치")
+    )
+    need_image = bool(crop_png_bytes) and (len(q_text) < 40 or has_visual_cue)
+
     context_excerpt = sliced_text[:6000] if sliced_text else ""
+    q_text_block = f"[원본 문항 텍스트]\n{q_text}\n\n" if q_text else ""
     prompt = (
         f"[원본 문항 정보]\n"
         f"- ID: {question.id} ({question.exam_name} {question.q_num}번)\n"
@@ -1007,14 +1023,15 @@ def rewrite_question_for_pdf(
         f"- 원본 정답: {question.answer}\n"
         f"- 원본 공식 해설 요약: {question.official_explanation}\n"
         f"- 반드시 제거·치환해야 할 범위 외 상위 용어: {out_of_scope_terms}\n\n"
+        f"{q_text_block}"
         f"[업로드된 PDF 허용 개념 (pdf_concepts)]\n{whitelist.pdf_concepts}\n\n"
         f"[업로드된 PDF 허용 용어 (pdf_vocabulary)]\n{whitelist.pdf_vocabulary}\n\n"
         f"[업로드된 PDF 본문 참고 발췌]\n{context_excerpt}\n\n"
-        "위 원본 문항 이미지를 보고, 범위 외 상위 용어를 PDF 내부 표현으로 자연스럽게 치환한 '변형 문제 카드'와 'PDF 맞춤 해설'을 작성하세요."
+        "위 원본 문항을 보고, 범위 외 상위 용어를 PDF 내부 표현으로 자연스럽게 치환한 '변형 문제 카드'와 'PDF 맞춤 해설'을 작성하세요."
     )
 
     contents: list[Any] = []
-    if crop_png_bytes:
+    if need_image and crop_png_bytes:
         contents.append(types.Part.from_bytes(data=optimize_image_for_vision(crop_png_bytes), mime_type="image/png"))
     contents.append(prompt)
 

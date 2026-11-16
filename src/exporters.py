@@ -2,10 +2,35 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 from datetime import datetime
 from typing import Callable
 
 from src.models import QuestionRecord
+
+
+def build_exam_ai_jsonl(records: list[QuestionRecord]) -> str:
+    """AI 서칭·문제 변형 시 토큰 소모를 최소화하도록 1문항 1줄 압축 JSONL 형식으로 직렬화한다."""
+    ordered = sorted(records, key=lambda r: r.q_num)
+    lines: list[str] = []
+    for r in ordered:
+        compact_obj: dict[str, object] = {
+            "id": r.id,
+            "q": r.q_num,
+            "subj": r.curriculum_subject,
+            "unit": r.unit_name,
+            "gr": r.min_grade,
+            "single": r.is_single_concept,
+            "prin": r.core_principles,
+            "terms": r.required_terms,
+            "ans": r.answer,
+            "exp": r.official_explanation,
+        }
+        q_txt = (getattr(r, "question_text", "") or "").strip()
+        if q_txt:
+            compact_obj["txt"] = q_txt
+        lines.append(json.dumps(compact_obj, ensure_ascii=False, separators=(",", ":")))
+    return "\n".join(lines)
 
 
 def build_exam_markdown(

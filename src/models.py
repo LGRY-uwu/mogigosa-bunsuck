@@ -45,6 +45,10 @@ class QuestionRecord(BaseModel):
     )
     answer: str = Field(..., description="공식 정답")
     official_explanation: str = Field(..., description="공식 해설 핵심 풀이 요약")
+    question_text: str = Field(
+        default="",
+        description="PyMuPDF로 추출한 문항 원문 텍스트 (AI 서칭·변형 시 토큰 절감용)",
+    )
     image_filename: str = Field(default="", description="크롭된 문항 PNG 파일명")
     source_pdf: str = Field(default="", description="원본 문제지 PDF 파일명")
     answer_pdf: str = Field(default="", description="원본 해설지 PDF 파일명")

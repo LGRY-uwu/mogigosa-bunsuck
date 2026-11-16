@@ -49,7 +49,7 @@ from src.config import (
     resolve_credentials,
 )
 from src.ebsi_fetcher import attempt_ebsi_pdf_fetch
-from src.exporters import build_exam_html, build_exam_markdown
+from src.exporters import build_exam_ai_jsonl, build_exam_html, build_exam_markdown
 from src.gemini_service import (
     analyze_exam_pdf_batch_with_gemini,
     analyze_question_with_gemini,
@@ -1552,6 +1552,7 @@ with tab1:
                     is_single_concept=extracted.is_single_concept,
                     answer=extracted.answer,
                     official_explanation=extracted.official_explanation,
+                    question_text=re.sub(r"\s+", " ", (cq.extracted_text or "")).strip(),
                     image_filename=img_filename,
                     source_pdf=f"{safe_exam}__문제지.pdf",
                     answer_pdf=f"{safe_exam}__해설지.pdf" if meta.get("ans_bytes") else "",
@@ -1845,7 +1846,7 @@ with tab1:
                                 st.rerun()
 
                         # 회차별 정리 파일 & 원본 PDF 다운로드 바
-                        dl_c1, dl_c2, dl_c3, dl_c4, dl_c5 = st.columns(5)
+                        dl_c1, dl_c2, dl_c3, dl_c4, dl_c5, dl_c6 = st.columns(6)
                         with dl_c1:
                             html_str = build_exam_html(
                                 exam_name,
@@ -1874,10 +1875,20 @@ with tab1:
                                 use_container_width=True,
                             )
                         with dl_c3:
+                            ai_jsonl_str = build_exam_ai_jsonl(exam_recs)
+                            st.download_button(
+                                "🤖 AI용(JSONL)",
+                                data=ai_jsonl_str.encode("utf-8"),
+                                file_name=f"{safe_fn_prefix}_ai_index.jsonl",
+                                mime="application/x-ndjson",
+                                key=f"dl_jsonl_search_{subj_cat}_{safe_fn_prefix}",
+                                use_container_width=True,
+                            )
+                        with dl_c4:
                             json_str = json.dumps(
                                 [r.model_dump() for r in exam_recs],
                                 ensure_ascii=False,
-                                indent=2,
+                                separators=(",", ":"),
                             )
                             st.download_button(
                                 "📦 JSON",
@@ -1890,7 +1901,7 @@ with tab1:
 
                         prob_pdf_name = next((r.source_pdf for r in exam_recs if r.source_pdf), "")
                         ans_pdf_name = next((r.answer_pdf for r in exam_recs if r.answer_pdf), "")
-                        with dl_c4:
+                        with dl_c5:
                             prob_bytes = (
                                 storage.get_pdf_bytes(prob_pdf_name, subject_category=subj_cat, exam_name=exam_name)
                                 if prob_pdf_name
@@ -1905,7 +1916,7 @@ with tab1:
                                     key=f"dl_prob_search_{subj_cat}_{safe_fn_prefix}",
                                     use_container_width=True,
                                 )
-                        with dl_c5:
+                        with dl_c6:
                             ans_bytes = (
                                 storage.get_pdf_bytes(ans_pdf_name, subject_category=subj_cat, exam_name=exam_name)
                                 if ans_pdf_name
