@@ -15,12 +15,16 @@ from src.models import TierType, UserRecord
 from src.storage import StorageManager
 
 KST = timezone(timedelta(hours=9))
-FREE_DAILY_LIMIT = 5
-VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ADMIN")
+FREE_DAILY_LIMIT = 5  # 하위 호환용 상수 (개편 후 FREE는 업로드/3.5-lite 무제한)
+PRO_WEEKLY_PREMIUM_LIMIT = 20
+FREE_EXAMS_PER_UNLOCK = 3
+PREMIUM_MODEL_IDS: tuple[str, ...] = ("gemini-3.8-flash", "gemini-4-hydrogen")
+VALID_TIERS: tuple[TierType, ...] = ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
 TIER_LABELS: dict[TierType, str] = {
-    "FREE": "무료 회원",
-    "CUSTOM": "개인 키 모드",
-    "PRO": "VIP 회원",
+    "FREE": "무료 (0원)",
+    "CUSTOM": "개인 키 (0원)",
+    "PRO": "PRO (1,990원/월)",
+    "ULTRA": "ULTRA (4,900원/월)",
     "ADMIN": "최고 관리자",
 }
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,30}$")
@@ -29,6 +33,17 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,30}$")
 def get_kst_today_str() -> str:
     """한국 표준시(KST) 기준 오늘 날짜 YYYY-MM-DD를 반환한다."""
     return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def get_kst_week_str() -> str:
+    """한국 표준시(KST) 기준 ISO 주차 YYYY-Www를 반환한다 (매주 월요일 초기화)."""
+    return datetime.now(KST).strftime("%G-W%V")
+
+
+def is_premium_model(model_name: str | None) -> bool:
+    """3.8 이상 또는 Hydrogen 고급 추론 모델인지 여부를 반환한다."""
+    raw = (model_name or "").strip().lower()
+    return raw in PREMIUM_MODEL_IDS or "3.8" in raw or "hydrogen" in raw
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -154,11 +169,16 @@ def verify_session_token(token: str, storage: StorageManager | None = None) -> s
 
 
 def _sync_user_state(user: UserRecord, today: str, admin_usernames: set[str]) -> bool:
-    """자정(KST) 초기화 및 관리자 아이디 자동 ADMIN 승급을 동기화한다."""
+    """자정(KST) · 주간(KST) 초기화 및 관리자 아이디 자동 ADMIN 승급을 동기화한다."""
     changed = False
+    current_week = get_kst_week_str()
     if user.last_used_date != today:
         user.daily_count = 0
         user.last_used_date = today
+        changed = True
+    if user.last_used_week != current_week:
+        user.weekly_premium_count = 0
+        user.last_used_week = current_week
         changed = True
     if user.username in admin_usernames and user.tier != "ADMIN":
         user.tier = "ADMIN"
@@ -321,24 +341,133 @@ def resolve_active_gemini_api_key(user: UserRecord, server_api_key: str) -> tupl
 
 
 def get_remaining_free_quota(user: UserRecord) -> int | None:
-    """FREE 등급의 오늘 남은 무료 추출 문항 수를 반환한다. CUSTOM/PRO/ADMIN은 None(무제한)."""
-    if user.tier in ("CUSTOM", "PRO", "ADMIN"):
+    """개편 후 FREE 등급은 기본 추출·업로드가 무제한(3.5 Flash-Lite 고정)이므로 None을 반환한다."""
+    return None
+
+
+def get_remaining_pro_weekly_quota(user: UserRecord) -> int | None:
+    """PRO 등급의 이번 주(KST) 남은 고급 모델(3.8 / Hydrogen) 작업 횟수를 반환한다. 타 등급은 None."""
+    if user.tier != "PRO":
         return None
-    today = get_kst_today_str()
-    used_today = user.daily_count if user.last_used_date == today else 0
-    return max(0, FREE_DAILY_LIMIT - used_today)
+    current_week = get_kst_week_str()
+    used_week = user.weekly_premium_count if user.last_used_week == current_week else 0
+    return max(0, PRO_WEEKLY_PREMIUM_LIMIT - used_week)
 
 
 def can_use_premium_features(user: UserRecord) -> bool:
-    """상위 과목 문제 자동 개조 및 맞춤형 시험지 PDF 병합 허용 여부 (CUSTOM/PRO/ADMIN)."""
-    return user.tier in ("CUSTOM", "PRO", "ADMIN")
+    """문제 자동 개조 및 맞춤형 시험지 PDF 병합 허용 여부 (개편 후 전 등급 허용, FREE는 3.5 Flash-Lite 기본)."""
+    return user.tier in ("FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN")
 
 
 def can_access_shared_concept_db(user: UserRecord | None) -> bool:
-    """공용 개념서·교과서 DB 구축(업로드) 및 단원별 불러오기 권한 여부 (PRO[VIP] / ADMIN 전용)."""
+    """공용 개념서·교과서 DB 구축(업로드) 및 단원별 불러오기 권한 여부 (PRO / ULTRA / ADMIN 전용)."""
     if user is None:
         return False
-    return user.tier in ("PRO", "ADMIN")
+    return user.tier in ("PRO", "ULTRA", "ADMIN")
+
+
+def resolve_model_for_user(user: UserRecord, requested_model: str) -> tuple[str, str]:
+    """
+    회원 등급과 잔여 해금/주간 한도에 따라 실제 호출할 Gemini 모델 ID와 안내 메시지를 결정한다.
+    - FREE: 기본 추론은 항상 gemini-3.5-flash-lite. 단, 기출 3회 업로드당 1회 해금된 크레딧이 있으면 3.8/Hydrogen 1회 허용.
+    - CUSTOM / ULTRA / ADMIN: 선택한 모든 모델 무제한 허용.
+    - PRO: 3.5 계열 무제한, 3.8/Hydrogen은 주간 20회 이하 허용(소진 시 gemini-3.5-flash로 우회).
+    """
+    req = (requested_model or "").strip() or "gemini-3.5-flash-lite"
+    if user.tier in ("CUSTOM", "ULTRA", "ADMIN"):
+        return req, ""
+
+    if user.tier == "PRO":
+        if is_premium_model(req):
+            rem = get_remaining_pro_weekly_quota(user) or 0
+            if rem <= 0:
+                return (
+                    "gemini-3.5-flash",
+                    f"PRO 주간 고급 모델 한도({PRO_WEEKLY_PREMIUM_LIMIT}회)를 모두 사용해 Gemini 3.5 Flash로 실행됩니다.",
+                )
+        return req, ""
+
+    # FREE 등급
+    if is_premium_model(req):
+        if user.premium_unlock_credits > 0:
+            return req, ""
+        progress = user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK
+        return (
+            "gemini-3.5-flash-lite",
+            f"FREE 등급은 기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 고급 모델(3.8/Hydrogen) 1회 해금됩니다 "
+            f"(현재 {progress}/{FREE_EXAMS_PER_UNLOCK}회). Gemini 3.5 Flash-Lite로 실행됩니다.",
+        )
+
+    if req != "gemini-3.5-flash-lite":
+        return "gemini-3.5-flash-lite", ""
+    return req, ""
+
+
+def record_exam_upload_for_user(
+    storage: StorageManager,
+    username: str,
+) -> tuple[UserRecord | None, bool]:
+    """
+    기출 PDF 업로드·태깅 완료 시 회원의 누적 업로드 횟수를 +1 하고,
+    FREE 등급인 경우 3회마다 고급 모델(3.8/Hydrogen) 해금 크레딧 1회를 지급한다.
+    """
+    norm_id = normalize_username(username)
+    users = storage.load_users()
+    today = get_kst_today_str()
+    admin_names = resolve_admin_config().admin_usernames
+    target: UserRecord | None = None
+    unlocked = False
+
+    for u in users:
+        if u.username == norm_id:
+            _sync_user_state(u, today, admin_names)
+            u.uploaded_exam_count += 1
+            if u.tier == "FREE" and u.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK == 0:
+                u.premium_unlock_credits += 1
+                unlocked = True
+            target = u
+            break
+
+    if target is not None:
+        storage.save_users(users)
+    return target, unlocked
+
+
+def consume_premium_model_usage(
+    storage: StorageManager,
+    username: str,
+    used_model: str,
+) -> UserRecord | None:
+    """
+    고급 모델(3.8 / Hydrogen) 작업 실행 시 등급별 크레딧 또는 주간 사용량을 1회 차감/누적한다.
+    CUSTOM / ULTRA / ADMIN 또는 일반(3.5) 모델 실행 시에는 차감하지 않는다.
+    """
+    if not is_premium_model(used_model):
+        return None
+    norm_id = normalize_username(username)
+    users = storage.load_users()
+    today = get_kst_today_str()
+    admin_names = resolve_admin_config().admin_usernames
+    target: UserRecord | None = None
+    changed = False
+
+    for u in users:
+        if u.username == norm_id:
+            if _sync_user_state(u, today, admin_names):
+                changed = True
+            if u.tier == "FREE" and u.premium_unlock_credits > 0:
+                u.premium_unlock_credits -= 1
+                changed = True
+            elif u.tier == "PRO":
+                u.weekly_premium_count += 1
+                u.last_used_week = get_kst_week_str()
+                changed = True
+            target = u
+            break
+
+    if changed and target is not None:
+        storage.save_users(users)
+    return target
 
 
 def consume_extraction_quota(
@@ -347,8 +476,7 @@ def consume_extraction_quota(
     extracted_count: int,
 ) -> UserRecord | None:
     """
-    추출한 문항 수만큼 서버 사용량을 누적한다.
-    CUSTOM 회원은 본인 API 키를 사용하므로 서버 한도(daily_count)를 차감하지 않는다.
+    추출한 문항 수만큼 서버 사용량(daily_count)을 기록한다 (하위 호환용; 개편 후 FREE 한도 제한 없음).
     """
     norm_id = normalize_username(username)
     users = storage.load_users()

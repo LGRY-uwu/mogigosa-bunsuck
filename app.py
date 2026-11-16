@@ -13,6 +13,8 @@ import streamlit as st
 
 from src.auth import (
     FREE_DAILY_LIMIT,
+    FREE_EXAMS_PER_UNLOCK,
+    PRO_WEEKLY_PREMIUM_LIMIT,
     TIER_LABELS,
     VALID_TIERS,
     authenticate_user,
@@ -21,12 +23,17 @@ from src.auth import (
     can_use_premium_features,
     clear_user_custom_api_key,
     consume_extraction_quota,
+    consume_premium_model_usage,
     create_session_token,
     get_remaining_free_quota,
+    get_remaining_pro_weekly_quota,
     get_user_by_username,
+    is_premium_model,
     mask_api_key,
+    record_exam_upload_for_user,
     register_user,
     resolve_active_gemini_api_key,
+    resolve_model_for_user,
     save_user_custom_api_key,
     verify_session_token,
 )
@@ -272,30 +279,46 @@ with st.sidebar:
                     else:
                         st.error(msg)
     else:
-        remaining_q = get_remaining_free_quota(current_user)
         tier_code = current_user.tier
         tier_kor = TIER_LABELS.get(tier_code, tier_code)
         active_gemini_key, active_key_label = resolve_active_gemini_api_key(
             current_user, creds.gemini_api_key
         )
+        pro_weekly_rem = get_remaining_pro_weekly_quota(current_user)
 
         if tier_code == "FREE":
+            upload_prog = current_user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK
+            credits = current_user.premium_unlock_credits
             status_line = (
-                f"<div style='font-size:0.84rem; color:#334155; margin-top:0.45rem;'>"
-                f"오늘 남은 무료 추출: <b>{remaining_q} / {FREE_DAILY_LIMIT}회</b>"
-                f"<br/><span style='font-size:0.75rem; color:#64748B;'>매일 자정(00:00 KST) 자동 초기화</span></div>"
+                f"<div style='font-size:0.83rem; color:#334155; margin-top:0.45rem;'>"
+                f"기출 업로드: <b>무제한</b> (기본 추론 3.5 Flash-Lite)<br/>"
+                f"고급 모델(3.8/Hydrogen) 해금: <b>{credits}회</b> "
+                f"<span style='color:#64748B;'>({upload_prog}/{FREE_EXAMS_PER_UNLOCK}회 업로드)</span>"
+                f"</div>"
             )
         elif tier_code == "CUSTOM":
             masked = _html.escape(mask_api_key(current_user.custom_api_key))
             status_line = (
-                f"<div style='font-size:0.84rem; color:#166534; margin-top:0.45rem;'>"
+                f"<div style='font-size:0.83rem; color:#166534; margin-top:0.45rem;'>"
                 f"등록된 개인 키: <code>{masked}</code>"
-                f"<br/><b>무제한 추출 · 문제 개조 · PDF 병합</b></div>"
+                f"<br/><b>모든 모델 · 모든 기능 무제한</b></div>"
+            )
+        elif tier_code == "PRO":
+            status_line = (
+                f"<div style='font-size:0.83rem; color:#1D4ED8; margin-top:0.45rem;'>"
+                f"✨ 서버 API · 업로드 무제한<br/>"
+                f"주간 고급 모델(3.8/Hydrogen): <b>{pro_weekly_rem} / {PRO_WEEKLY_PREMIUM_LIMIT}회</b>"
+                f"</div>"
+            )
+        elif tier_code == "ULTRA":
+            status_line = (
+                "<div style='font-size:0.83rem; color:#C2410C; font-weight:600; margin-top:0.45rem;'>"
+                "🔥 서버 API · 모든 모델·기능 한도 없이 무제한</div>"
             )
         else:
             status_line = (
-                "<div style='font-size:0.84rem; color:#1D4ED8; font-weight:600; margin-top:0.45rem;'>"
-                "✨ 서버 API 키 무제한 이용 중</div>"
+                "<div style='font-size:0.83rem; color:#1D4ED8; font-weight:600; margin-top:0.45rem;'>"
+                "🛡️ 최고 관리자 · 전체 기능 및 회원 관리</div>"
             )
 
         st.markdown(
@@ -306,7 +329,7 @@ with st.sidebar:
                   <div style="font-size:1rem; font-weight:800; color:#0F172A;">{_html.escape(current_user.nickname)}</div>
                   <div style="font-size:0.78rem; color:#64748B;">@{_html.escape(current_user.username)}</div>
                 </div>
-                <span class="tier-badge tier-{tier_code}">{tier_kor} ({tier_code})</span>
+                <span class="tier-badge tier-{tier_code}">{tier_kor}</span>
               </div>
               {status_line}
             </div>
@@ -314,8 +337,10 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-        if remaining_q is not None:
-            st.progress(remaining_q / FREE_DAILY_LIMIT)
+        if tier_code == "FREE":
+            st.progress((current_user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK) / FREE_EXAMS_PER_UNLOCK)
+        elif tier_code == "PRO" and pro_weekly_rem is not None:
+            st.progress(pro_weekly_rem / PRO_WEEKLY_PREMIUM_LIMIT)
 
         # CUSTOM 개인 API 키 관리 UI
         if tier_code == "FREE":
@@ -366,13 +391,23 @@ with st.sidebar:
             st.rerun()
 
         st.markdown("---")
-        selected_model = st.selectbox(
+        default_idx = (
+            AVAILABLE_MODELS.index("gemini-3.5-flash-lite")
+            if tier_code == "FREE" and "gemini-3.5-flash-lite" in AVAILABLE_MODELS
+            else AVAILABLE_MODELS.index(DEFAULT_MODEL)
+        )
+        requested_model = st.selectbox(
             "🤖 Gemini 모델 선택",
             options=AVAILABLE_MODELS,
-            index=AVAILABLE_MODELS.index(DEFAULT_MODEL),
+            index=default_idx,
             format_func=lambda m: MODEL_LABELS.get(m, m),
-            help="기본 추천 모델은 Gemini 3.5 Flash 입니다.",
+            help="FREE 등급은 기본 3.5 Flash-Lite로 실행되며, 기출 3회 업로드당 고급 모델(3.8/Hydrogen) 1회가 해금됩니다.",
         )
+        selected_model, model_notice = resolve_model_for_user(current_user, requested_model)
+        if model_notice:
+            st.caption(f"ℹ️ {model_notice}")
+        elif tier_code == "FREE" and is_premium_model(selected_model):
+            st.caption(f"🔓 해금 크레딧 1회 사용 예정 (보유: {current_user.premium_unlock_credits}회)")
 
         # 저장소 & DB 요약
         all_records = storage.load_db()
@@ -439,12 +474,13 @@ def _render_admin_panel() -> None:
         return
 
     tier_counts = {t: sum(1 for u in users_list if u.tier == t) for t in VALID_TIERS}
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("전체 회원", f"{len(users_list)}명")
-    m2.metric("무료 회원 (FREE)", f"{tier_counts['FREE']}명")
-    m3.metric("개인 키 (CUSTOM)", f"{tier_counts['CUSTOM']}명")
-    m4.metric("VIP 회원 (PRO)", f"{tier_counts['PRO']}명")
-    m5.metric("최고 관리자 (ADMIN)", f"{tier_counts['ADMIN']}명")
+    m2.metric("FREE (0원)", f"{tier_counts['FREE']}명")
+    m3.metric("CUSTOM (0원)", f"{tier_counts['CUSTOM']}명")
+    m4.metric("PRO (1,990원)", f"{tier_counts['PRO']}명")
+    m5.metric("ULTRA (4,900원)", f"{tier_counts['ULTRA']}명")
+    m6.metric("ADMIN", f"{tier_counts['ADMIN']}명")
 
     filtered_users = [
         u
@@ -460,8 +496,9 @@ def _render_admin_panel() -> None:
             "현재 등급": u.tier,
             "등급 설명": TIER_LABELS.get(u.tier, u.tier),
             "개인 키": mask_api_key(u.custom_api_key) or "-",
-            "오늘 사용량": u.daily_count,
-            "최근 사용일": u.last_used_date or "-",
+            "기출 업로드": u.uploaded_exam_count,
+            "해금 크레딧": u.premium_unlock_credits,
+            "주간 고급사용": u.weekly_premium_count,
         }
         for u in filtered_users
     ]
@@ -478,8 +515,9 @@ def _render_admin_panel() -> None:
             ),
             "등급 설명": st.column_config.TextColumn("등급명", disabled=True),
             "개인 키": st.column_config.TextColumn("개인 키", disabled=True),
-            "오늘 사용량": st.column_config.NumberColumn("오늘 사용량", disabled=True),
-            "최근 사용일": st.column_config.TextColumn("최근 사용일", disabled=True),
+            "기출 업로드": st.column_config.NumberColumn("기출 업로드", disabled=True),
+            "해금 크레딧": st.column_config.NumberColumn("해금 크레딧", disabled=True),
+            "주간 고급사용": st.column_config.NumberColumn("주간 고급사용", disabled=True),
         },
         hide_index=True,
         use_container_width=True,
@@ -504,34 +542,41 @@ def _render_admin_panel() -> None:
 
 if current_user is None:
     st.info("👈 좌측 사이드바 상단의 **[로그인 / 회원가입]** 탭에서 로그인하시면 기출 수집·추출·문제 개조 기능을 이용하실 수 있습니다.")
-    t_col1, t_col2, t_col3, t_col4 = st.columns(4)
+    t_col1, t_col2, t_col3, t_col4, t_col5 = st.columns(5)
     with t_col1:
         with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-FREE'>무료 회원 (FREE)</span>", unsafe_allow_html=True)
-            st.markdown("#### 기본 가입 등급")
-            st.write("- 서버 API 키 사용")
-            st.write("- 하루 **최대 5문제** 추출")
-            st.write("- 모드 B 웹 풀기 & AI 해설")
+            st.markdown("<span class='tier-badge tier-FREE'>FREE · 0원</span>", unsafe_allow_html=True)
+            st.markdown("#### 무료 회원")
+            st.write("- 기출 PDF 업로드 **무제한**")
+            st.write("- 기본 추론 **3.5 Flash-Lite** 전용")
+            st.write("- 기출 **3회 업로드마다** 3.8/Hydrogen **1회 해금**")
     with t_col2:
         with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-CUSTOM'>개인 키 모드 (CUSTOM)</span>", unsafe_allow_html=True)
-            st.markdown("#### 본인 API 키 등록")
-            st.write("- **승인 없이 즉시 전환**")
-            st.write("- 한도 차감 없이 **무제한**")
-            st.write("- 문제 개조 & PDF 병합 허용")
+            st.markdown("<span class='tier-badge tier-CUSTOM'>CUSTOM · 0원</span>", unsafe_allow_html=True)
+            st.markdown("#### 개인 API 키")
+            st.write("- FREE와 동일 + **본인 API 키 등록**")
+            st.write("- 모든 모델 · 모든 추론 **무제한**")
+            st.write("- 승인 없이 즉시 전환")
     with t_col3:
         with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-PRO'>VIP 회원 (PRO)</span>", unsafe_allow_html=True)
-            st.markdown("#### 관리자 승급 등급")
-            st.write("- 서버 API 키 사용 · 추출 **무제한**")
-            st.write("- **공용 개념서·교과서 DB** 구축 & 불러오기")
-            st.write("- 문제 개조 & PDF 병합 무제한")
+            st.markdown("<span class='tier-badge tier-PRO'>PRO · 1,990원/월</span>", unsafe_allow_html=True)
+            st.markdown("#### 스탠다드 유료")
+            st.write("- **서버 API 제공** · 업로드 **무제한**")
+            st.write("- **주간 20회 이하** 3.8/Hydrogen 사용")
+            st.write("- **공용 개념서 DB** 이용 가능")
     with t_col4:
         with st.container(border=True):
-            st.markdown("<span class='tier-badge tier-ADMIN'>최고 관리자 (ADMIN)</span>", unsafe_allow_html=True)
-            st.markdown("#### 관리자 계정")
-            st.write("- 서버 API 키 **무제한**")
-            st.write("- **공용 개념서·교과서 DB** 구축 & 관리")
+            st.markdown("<span class='tier-badge tier-ULTRA'>ULTRA · 4,900원/월</span>", unsafe_allow_html=True)
+            st.markdown("#### 무제한 유료")
+            st.write("- PRO 모든 혜택 포함")
+            st.write("- 3.8/Hydrogen 포함 **한도 없이 무제한**")
+            st.write("- **공용 개념서 DB** 무제한 이용")
+    with t_col5:
+        with st.container(border=True):
+            st.markdown("<span class='tier-badge tier-ADMIN'>ADMIN</span>", unsafe_allow_html=True)
+            st.markdown("#### 최고 관리자")
+            st.write("- ULTRA와 동일 (모든 기능 **무제한**)")
+            st.write("- **공용 개념서 DB** 구축 & 관리")
             st.write("- **회원 등급 관리** 패널 접근")
     st.stop()
 
@@ -1428,6 +1473,15 @@ with tab1:
             sync_notice.empty()
             status_placeholder.empty()
 
+            if not is_retry and newly_saved:
+                upd_u, unlocked = record_exam_upload_for_user(storage, current_user.username)
+                if unlocked and upd_u is not None:
+                    st.success(
+                        f"🎉 기출 PDF {FREE_EXAMS_PER_UNLOCK}회분 업로드 달성! "
+                        f"고급 추론 모델(3.8 / Hydrogen) **1회 사용권**이 해금되었습니다. "
+                        f"(보유 해금 크레딧: {upd_u.premium_unlock_credits}회)"
+                    )
+
             prev_saved = (
                 st.session_state.get("stage2_saved_q_nums", [])
                 if is_retry and st.session_state.get("stage2_exam_name") == meta["exam_name"]
@@ -2028,19 +2082,24 @@ with tab2:
         st.subheader("2️⃣~3️⃣ 엄격한 범위 내 기출 매칭 & 상위 문제 자동 개조")
 
         is_premium = can_use_premium_features(current_user)
-        remaining_quota = get_remaining_free_quota(current_user)
-
-        if not is_premium:
-            if remaining_quota == 0:
-                st.warning(
-                    f"🆓 **무료 회원 (FREE)**: 오늘의 무료 추출 한도({FREE_DAILY_LIMIT}문제)를 모두 사용했습니다. "
-                    "자정(00:00 KST)에 초기화되며, 사이드바에서 **개인 API 키 등록(CUSTOM)** 또는 **VIP 승급(PRO)** 시 무제한 이용 가능합니다."
+        pro_rem_weekly = get_remaining_pro_weekly_quota(current_user)
+        if current_user.tier == "FREE":
+            if is_premium_model(selected_model):
+                st.info(
+                    f"🔓 **무료 회원 (FREE)** · 해금 크레딧 사용: **{MODEL_LABELS.get(selected_model, selected_model)}** "
+                    f"(실행 시 크레딧 1회 차감 · 남은 크레딧 {current_user.premium_unlock_credits}회)"
                 )
             else:
+                prog_mod = current_user.uploaded_exam_count % FREE_EXAMS_PER_UNLOCK
                 st.info(
-                    f"🆓 **무료 회원 (FREE)**: 오늘 남은 무료 추출 **{remaining_quota} / {FREE_DAILY_LIMIT}문제** "
-                    "(상위 문제 자동 개조 및 PDF 병합은 CUSTOM · PRO · ADMIN 전용)"
+                    f"🆓 **무료 회원 (FREE)** · **Gemini 3.5 Flash-Lite**로 추론 실행 "
+                    f"(기출 PDF {FREE_EXAMS_PER_UNLOCK}회 업로드마다 3.8/Hydrogen 1회 해금 · 현재 {prog_mod}/{FREE_EXAMS_PER_UNLOCK}회)"
                 )
+        elif current_user.tier == "PRO" and is_premium_model(selected_model):
+            st.info(
+                f"💎 **PRO (1,990원/월)** · 주간 고급 모델({MODEL_LABELS.get(selected_model, selected_model)}) "
+                f"남은 횟수: **{pro_rem_weekly} / {PRO_WEEKLY_PREMIUM_LIMIT}회**"
+            )
 
         with st.container(border=True):
             opt_c1, opt_c2, opt_c3 = st.columns(3)
@@ -2050,8 +2109,8 @@ with tab2:
                 filter_grade = st.selectbox("학년 수준 필터", ["전체", "고1 이하", "고2 이하"], index=0)
             with opt_c3:
                 count_mode = st.radio("추출 문항 수", ["전체", "N문제 지정"], horizontal=True)
-                max_allowed_n = 100 if is_premium else max(1, remaining_quota or 1)
-                default_n = min(5, max_allowed_n)
+                max_allowed_n = 100
+                default_n = 5
                 target_n = default_n
                 if count_mode == "N문제 지정":
                     target_n = int(
@@ -2063,36 +2122,20 @@ with tab2:
                             step=1,
                         )
                     )
-                elif not is_premium and remaining_quota is not None:
-                    st.caption(f"무료 회원(FREE)은 오늘 최대 {remaining_quota}문제까지만 추출됩니다.")
 
             chk_c1, chk_c2 = st.columns(2)
             with chk_c1:
                 only_single = st.checkbox("단일 개념 문항만 보기 (`is_single_concept`)", value=False)
             with chk_c2:
-                if is_premium:
-                    auto_rewrite_mode = st.checkbox(
-                        "✨ 상위 과목 문제 자동 개조 모드 (PDF-Grounded Rewriter)",
-                        value=True,
-                        help="풀이 원리는 PDF로 해결되지만 범위 외 상위 용어(mol, 엔탈피, 한계효용 등)가 포함된 문항을 PDF 내부 용어만으로 자동 개조합니다.",
-                    )
-                else:
-                    st.checkbox(
-                        "✨ 상위 과목 문제 자동 개조 모드 (🔒 CUSTOM · PRO 전용)",
-                        value=False,
-                        disabled=True,
-                        help="사이드바에서 개인 API 키를 등록(CUSTOM)하거나 PRO 등급으로 승급하면 상위 과목 용어를 개념서 용어로 자동 치환해 출제합니다.",
-                    )
-                    auto_rewrite_mode = False
+                auto_rewrite_mode = st.checkbox(
+                    "✨ 상위 과목 문제 자동 개조 모드 (PDF-Grounded Rewriter)",
+                    value=True,
+                    help="풀이 원리는 PDF로 해결되지만 범위 외 상위 용어(mol, 엔탈피, 한계효용 등)가 포함된 문항을 PDF 내부 용어만으로 자동 개조합니다.",
+                )
 
             if st.button("🚀 기출 매칭 & 개념서 맞춤 문제 추출·개조 실행", type="primary"):
                 db_list = storage.load_db()
-                if not is_premium and (remaining_quota or 0) <= 0:
-                    st.error(
-                        f"오늘의 무료 추출 한도({FREE_DAILY_LIMIT}문제)를 모두 소진했습니다. "
-                        "사이드바에서 개인 API 키를 등록(CUSTOM)하면 즉시 무제한 이용할 수 있습니다."
-                    )
-                elif not active_gemini_key:
+                if not active_gemini_key:
                     st.error(f"사용 가능한 Gemini API 키({active_key_label})가 설정되지 않았습니다.")
                 elif not db_list:
                     st.warning("저장된 기출 DB가 비어 있습니다. 먼저 [탭 1]에서 모의고사를 수집·태깅해 주세요.")
@@ -2144,11 +2187,6 @@ with tab2:
 
                         if count_mode == "N문제 지정":
                             selected_pairs = selected_pairs[:target_n]
-
-                        truncated_by_free = False
-                        if not is_premium and remaining_quota is not None and len(selected_pairs) > remaining_quota:
-                            selected_pairs = selected_pairs[:remaining_quota]
-                            truncated_by_free = True
 
                         st.session_state["match_diagnostics"] = diagnostics
 
@@ -2208,8 +2246,11 @@ with tab2:
                                 prog.progress(idx / len(selected_pairs))
 
                             stat.empty()
-                            updated_u = consume_extraction_quota(
+                            consume_extraction_quota(
                                 storage, current_user.username, len(assembled)
+                            )
+                            updated_u = consume_premium_model_usage(
+                                storage, current_user.username, selected_model
                             )
                             st.session_state["matched_items"] = assembled
                             st.session_state["generated_exam_pdf"] = None
@@ -2218,12 +2259,12 @@ with tab2:
                             st.session_state["ai_explanations"] = {}
                             st.session_state["ai_chats"] = {}
                             rem_msg = ""
-                            if updated_u is not None:
-                                new_rem = get_remaining_free_quota(updated_u)
-                                if new_rem is not None:
-                                    rem_msg = f" | 오늘 남은 무료 추출: {new_rem}/{FREE_DAILY_LIMIT}문제"
-                            if truncated_by_free:
-                                st.info(f"FREE 등급 일일 한도 적용으로 {len(assembled)}문항만 추출되었습니다.")
+                            if updated_u is not None and is_premium_model(selected_model):
+                                if updated_u.tier == "FREE":
+                                    rem_msg = f" | 남은 고급 모델 해금 크레딧: {updated_u.premium_unlock_credits}회"
+                                elif updated_u.tier == "PRO":
+                                    pro_rem = get_remaining_pro_weekly_quota(updated_u)
+                                    rem_msg = f" | PRO 주간 고급 모델 잔여: {pro_rem}/{PRO_WEEKLY_PREMIUM_LIMIT}회"
                             st.success(
                                 f"🎯 총 {len(assembled)}문항 추출 완료! "
                                 f"(원문 그대로 {sum(1 for it in assembled if it['rewritten'] is None)}문항 · "

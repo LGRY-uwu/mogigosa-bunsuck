@@ -284,24 +284,35 @@ def infer_subject_category(subject: str) -> SubjectCategory:
     return "과학"
 
 
-TierType = Literal["FREE", "CUSTOM", "PRO", "ADMIN"]
+TierType = Literal["FREE", "CUSTOM", "PRO", "ULTRA", "ADMIN"]
 LEGACY_TIER_MAP: dict[str, str] = {
     "BYOK": "CUSTOM",
     "VIP": "PRO",
-    "ULTRA": "ADMIN",
 }
 
 
 class UserRecord(BaseModel):
-    """회원 계정 및 등급·개인 API 키·일일 사용량 스키마 (users.json 저장용)."""
+    """회원 계정 및 등급·개인 API 키·사용량 스키마 (users.json 저장용)."""
 
     username: str = Field(..., description="로그인 아이디 (학번 또는 영문·숫자 ID)")
     nickname: str = Field(..., description="표시 닉네임")
     password_hash: str = Field(..., description="salt$sha256 형식의 암호화 비밀번호")
-    tier: TierType = Field(default="FREE", description="회원 등급 (FREE / CUSTOM / PRO / ADMIN)")
+    tier: TierType = Field(default="FREE", description="회원 등급 (FREE / CUSTOM / PRO / ULTRA / ADMIN)")
     custom_api_key: str = Field(default="", description="CUSTOM 회원의 개인 Gemini API 키")
-    daily_count: int = Field(default=0, ge=0, description="금일 사용한 기출 추출 문항 수")
+    daily_count: int = Field(default=0, ge=0, description="금일 사용한 기출 추출 문항 수 (하위 호환)")
     last_used_date: str = Field(default="", description="마지막 추출 날짜 (YYYY-MM-DD, KST)")
+    uploaded_exam_count: int = Field(default=0, ge=0, description="누적 업로드·태깅한 기출 회차 수")
+    premium_unlock_credits: int = Field(
+        default=0,
+        ge=0,
+        description="FREE 등급 기출 3회 업로드당 1회 해금되는 고급 모델(3.8/Hydrogen) 크레딧",
+    )
+    weekly_premium_count: int = Field(
+        default=0,
+        ge=0,
+        description="PRO 등급 주간 고급 모델(3.8/Hydrogen) 사용 횟수",
+    )
+    last_used_week: str = Field(default="", description="마지막 주간 사용 주차 (YYYY-Www, KST)")
     created_at: str = Field(default="", description="가입 시각 (ISO 8601)")
 
     @field_validator("tier", mode="before")
